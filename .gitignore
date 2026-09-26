@@ -1,2 +1,37 @@
 release-captain-target/
 .DS_Store
+
+# ---- Credential / secret safety (IBM Hackathon security guidelines) ----
+.env
+.env.*
+!.env.example
+*apikey*
+*api-key*
+*credentials*
+*secret*
+*password*
+*token*
+!bob_sessions/
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+id_rsa
+id_dsa
+
+# ---- Other AI assistant session data (not part of the submission) ----
+.copilot/
+.cursor/
+.codeium/
+
+# ---- Common dev artifacts ----
+__pycache__/
+*.pyc
+venv/
+.venv/
+node_modules/
+dist/
+.vscode/
+.idea/
