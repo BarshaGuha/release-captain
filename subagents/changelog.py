@@ -29,6 +29,106 @@ Notes for Bob:
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+
+
+def _run_git(repo_path: str, *args: str) -> str:
+    """Run a git command inside repo_path and return stdout."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _classify(summary: str) -> str:
+    """Classify a commit summary into feature / fix / chore / other."""
+    lower = summary.lower()
+
+    # Conventional commit prefixes take priority
+    if lower.startswith(("feat:", "feat(", "feature:", "feature(")):
+        return "feature"
+    if lower.startswith(("fix:", "fix(", "bugfix:", "bugfix(")):
+        return "fix"
+    if lower.startswith(("chore:", "chore(", "refactor:", "refactor(", "docs:", "docs(",
+                          "test:", "test(", "ci:", "ci(", "build:", "build(",
+                          "style:", "style(", "perf:", "perf(")):
+        return "chore"
+
+    # Heuristic fallback on keyword presence
+    if any(w in lower for w in ("add", "new", "implement", "support", "introduce", "create", "filter")):
+        return "feature"
+    if any(w in lower for w in ("fix", "bug", "patch", "correct", "repair", "resolve", "revert")):
+        return "fix"
+    if any(w in lower for w in ("prep", "update", "bump", "upgrade", "clean", "refactor",
+                                 "remove", "delete", "rename", "move", "format", "lint",
+                                 "test", "spec", "doc", "readme", "changelog", "release")):
+        return "chore"
+
+    return "other"
+
 
 def run(repo_path: str, since_ref: str) -> dict:
-    raise NotImplementedError("Build this with Bob 2.0 — see BOB_PROMPTS.md")
+    """Run the changelog subagent and return the contract dict."""
+    raw = _run_git(repo_path, "log", f"{since_ref}..HEAD", "--oneline")
+
+    commits = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `git log --oneline` format: "<hash> <summary>"
+        parts = line.split(" ", 1)
+        if len(parts) < 2:
+            continue
+        commit_hash, summary = parts[0], parts[1]
+        commits.append({
+            "hash": commit_hash,
+            "summary": summary,
+            "kind": _classify(summary),
+        })
+
+    # Group by kind
+    groups: dict[str, list[dict]] = {
+        "feature": [],
+        "fix": [],
+        "chore": [],
+        "other": [],
+    }
+    for c in commits:
+        groups[c["kind"]].append(c)
+
+    # Build markdown — skip empty groups
+    section_labels = {
+        "feature": "## Features",
+        "fix": "## Fixes",
+        "chore": "## Chores",
+        "other": "## Other",
+    }
+    sections: list[str] = []
+    for kind, label in section_labels.items():
+        if groups[kind]:
+            lines = [label]
+            for c in groups[kind]:
+                lines.append(f"- {c['summary']} (`{c['hash']}`)")
+            sections.append("\n".join(lines))
+
+    release_notes_markdown = "\n\n".join(sections) if sections else "_No commits found in range._"
+
+    return {
+        "release_notes_markdown": release_notes_markdown,
+        "commit_count": len(commits),
+        "commits": commits,
+    }
+
+
+if __name__ == "__main__":
+    repo = sys.argv[1] if len(sys.argv) > 1 else "release-captain-target"
+    ref = sys.argv[2] if len(sys.argv) > 2 else "763d71b"
+    output = run(repo, ref)
+    print(json.dumps(output, indent=2))
