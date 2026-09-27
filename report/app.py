@@ -52,6 +52,54 @@ DEFAULT_BRANCH_LABEL = "release/v1.2.0 (GO scenario)"
 
 
 # ---------------------------------------------------------------------------
+# System bootstrap — install Node 22 on Streamlit Cloud if missing
+# ---------------------------------------------------------------------------
+
+_NODE_SENTINEL = os.path.join(os.path.expanduser("~"), ".node22_installed")
+
+
+def _ensure_node() -> None:
+    """Install Node.js 22 via NodeSource if it isn't available.
+
+    Only runs once per Cloud instance (sentinel file guards repeat installs).
+    On a developer's machine where node >=22 is already present this is a
+    no-op (the `node --version` check exits immediately).
+    """
+    # Fast path: node already present and recent enough
+    try:
+        result = subprocess.run(
+            ["node", "--version"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            ver = result.stdout.strip()          # e.g. "v22.14.0"
+            major = int(ver.lstrip("v").split(".")[0])
+            if major >= 22:
+                return                            # already good
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        pass                                      # node missing or too old — fall through
+
+    if os.path.exists(_NODE_SENTINEL):
+        # Already tried installing this session — don't loop
+        st.error("Node.js 22 install was attempted but node is still not found. Check app logs.")
+        st.stop()
+
+    st.info("⏳ Installing Node.js 22 — this only happens on the first cold start…")
+    with st.spinner("Setting up Node.js 22 via NodeSource…"):
+        subprocess.run(
+            "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+            shell=True,
+            check=True,
+        )
+        subprocess.run(
+            ["apt-get", "install", "-y", "nodejs"],
+            check=True,
+        )
+    open(_NODE_SENTINEL, "w").close()             # mark as done
+    st.success("✅ Node.js 22 installed.")
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Repo bootstrap — clone + npm install if the folder doesn't exist
 # ---------------------------------------------------------------------------
 
@@ -234,6 +282,9 @@ def _render_rollback(text: str) -> None:
 st.set_page_config(page_title="Release Captain", page_icon="🚢", layout="wide")
 
 st.title("🚢 Release Captain")
+
+# ── Ensure Node.js 22 is available (installs on Streamlit Cloud if missing) ──
+_ensure_node()
 
 # ── Ensure the target repo exists (clone on first run) ────────────────────
 _ensure_repo()
