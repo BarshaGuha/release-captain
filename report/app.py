@@ -206,8 +206,18 @@ def _checkout_branch(branch: str) -> None:
         ["git", "fetch", "--all"],
         cwd=REPO_PATH, check=True, capture_output=True, text=True,
     )
+    # Discard any modifications to tracked files (e.g. package-lock.json
+    # written by npm install in test.py) so they never block the checkout.
+    # HEAD may not exist on a fresh clone with no commits checked out yet,
+    # so fall back to an empty-tree reset in that case.
     subprocess.run(
-        ["git", "checkout", branch],
+        ["git", "reset", "--hard", "HEAD"],
+        cwd=REPO_PATH, check=False, capture_output=True, text=True,
+    )
+    # Use -B so the branch is created (or reset) from the remote tracking ref.
+    # This works whether the branch exists locally already or not.
+    subprocess.run(
+        ["git", "checkout", "-B", branch, f"origin/{branch}"],
         cwd=REPO_PATH, check=True, capture_output=True, text=True,
     )
 
