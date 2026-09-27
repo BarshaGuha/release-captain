@@ -52,49 +52,92 @@ DEFAULT_BRANCH_LABEL = "release/v1.2.0 (GO scenario)"
 
 
 # ---------------------------------------------------------------------------
-# System bootstrap — install Node 22 on Streamlit Cloud if missing
+# System bootstrap — install Node 22 via nvm (no root required)
 # ---------------------------------------------------------------------------
 
-_NODE_SENTINEL = os.path.join(os.path.expanduser("~"), ".node22_installed")
+_HOME          = os.path.expanduser("~")
+_NVM_DIR       = os.path.join(_HOME, ".nvm")
+_NODE_SENTINEL = os.path.join(_HOME, ".node22_installed")
+# After nvm installs Node 22, the binary lands here:
+_NODE_BIN_DIR  = os.path.join(_NVM_DIR, "versions", "node", "v22", "bin")
+
+
+def _node_version_ok() -> bool:
+    """Return True if `node` on PATH is version 22+."""
+    for node_cmd in ["node", os.path.join(_NODE_BIN_DIR, "node")]:
+        try:
+            r = subprocess.run(
+                [node_cmd, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                major = int(r.stdout.strip().lstrip("v").split(".")[0])
+                if major >= 22:
+                    return True
+        except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+
+def _inject_nvm_node_to_path() -> None:
+    """Prepend the nvm-installed Node 22 bin dir to os.environ['PATH']."""
+    # nvm may have installed into a versioned subdirectory — find it
+    versions_root = os.path.join(_NVM_DIR, "versions", "node")
+    node_bin = None
+    if os.path.isdir(versions_root):
+        candidates = sorted(
+            [d for d in os.listdir(versions_root) if d.startswith("v22")],
+            reverse=True,
+        )
+        if candidates:
+            node_bin = os.path.join(versions_root, candidates[0], "bin")
+    if node_bin and node_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = node_bin + os.pathsep + os.environ.get("PATH", "")
 
 
 def _ensure_node() -> None:
-    """Install Node.js 22 via NodeSource if it isn't available.
+    """Install Node.js 22 via nvm if it isn't available.
 
+    nvm installs entirely into ~/.nvm — no root, no apt, no system writes.
     Only runs once per Cloud instance (sentinel file guards repeat installs).
     On a developer's machine where node >=22 is already present this is a
-    no-op (the `node --version` check exits immediately).
+    no-op (the version check exits immediately).
     """
-    # Fast path: node already present and recent enough
-    try:
-        result = subprocess.run(
-            ["node", "--version"], capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            ver = result.stdout.strip()          # e.g. "v22.14.0"
-            major = int(ver.lstrip("v").split(".")[0])
-            if major >= 22:
-                return                            # already good
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        pass                                      # node missing or too old — fall through
+    # Inject nvm node bin dir into PATH on every run (cheap, idempotent)
+    _inject_nvm_node_to_path()
+
+    if _node_version_ok():
+        return   # already good — fast path
 
     if os.path.exists(_NODE_SENTINEL):
-        # Already tried installing this session — don't loop
-        st.error("Node.js 22 install was attempted but node is still not found. Check app logs.")
+        st.error(
+            "Node.js 22 install was attempted but `node` is still not available. "
+            "Check the app logs via Manage app → Logs."
+        )
         st.stop()
 
-    st.info("⏳ Installing Node.js 22 — this only happens on the first cold start…")
-    with st.spinner("Setting up Node.js 22 via NodeSource…"):
+    st.info("⏳ Installing Node.js 22 via nvm — this only happens on the first cold start…")
+    with st.spinner("Installing nvm…"):
         subprocess.run(
-            "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+            "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash",
             shell=True,
             check=True,
+            env={**os.environ, "NVM_DIR": _NVM_DIR},
         )
+
+    with st.spinner("Installing Node.js 22 (nvm install 22)…"):
+        # Source nvm then install — must run in a login shell so nvm is on PATH
         subprocess.run(
-            ["apt-get", "install", "-y", "nodejs"],
+            f'. "{_NVM_DIR}/nvm.sh" && nvm install 22 && nvm use 22',
+            shell=True,
             check=True,
+            executable="/bin/bash",
+            env={**os.environ, "NVM_DIR": _NVM_DIR},
         )
-    open(_NODE_SENTINEL, "w").close()             # mark as done
+
+    # Write sentinel and inject the new bin dir before rerunning
+    open(_NODE_SENTINEL, "w").close()
+    _inject_nvm_node_to_path()
     st.success("✅ Node.js 22 installed.")
     st.rerun()
 
