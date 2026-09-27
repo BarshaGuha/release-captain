@@ -51,7 +51,22 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
         pkg = json.loads((repo / "package.json").read_text())
         test_command = pkg["scripts"]["test"]
 
-    # Step 2 — run the command, capturing stdout+stderr, timing wall-clock
+    # Step 2a — install dependencies if node_modules is absent.
+    # Only runs on a cold environment; skipped once the tree is present so
+    # the timing numbers reported to the orchestrator aren't inflated.
+    if not (repo / "node_modules").exists():
+        install = subprocess.run(
+            ["npm", "install"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+        )
+        if install.returncode != 0:
+            raise RuntimeError(
+                f"npm install failed in {repo}:\n{install.stderr.strip()}"
+            )
+
+    # Step 2b — run the command, capturing stdout+stderr, timing wall-clock
     start = time.perf_counter()
     result = subprocess.run(
         test_command,
@@ -79,22 +94,53 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
 
     total = pass_count + fail_count
 
-    # Step 3b — collect individual failure entries from "not ok" lines
-    # Node TAP-ish failure lines: "not ok N - <description>"
-    failures: list[dict] = []
+    # Step 3b — collect individual failure entries.
+    # Node's built-in runner has two sections:
+    #   1. Inline streaming output:  "  ✖ <name> (Xms)" (indented = test-level)
+    #   2. "✖ failing tests:" summary block at the end with AssertionError text
+    #
+    # Strategy: collect failure names from section 1, then for each name look
+    # up its AssertionError message from section 2 (the trailing summary block).
     lines = combined.splitlines()
+
+    # Build a map: failure name → assertion message from the trailing block
+    assertion_map: dict[str, str] = {}
+    in_failing_block = False
+    current_fail_name: str | None = None
     for i, line in enumerate(lines):
+        stripped = line.strip()
+        if re.search(r"\u2716\s+failing tests", stripped):  # ✖ failing tests:
+            in_failing_block = True
+            continue
+        if not in_failing_block:
+            continue
+        # "✖ <name> (Xms)" inside the summary block
+        m = re.match(r"\u2716\s+(.+?)\s*\(\d+", stripped)
+        if m:
+            current_fail_name = m.group(1).strip()
+            assertion_map.setdefault(current_fail_name, "")
+            continue
+        # First non-empty, non-"test at" line after a name = the error message
+        if current_fail_name and stripped and not stripped.startswith("test at"):
+            if not assertion_map[current_fail_name]:
+                assertion_map[current_fail_name] = stripped
+                current_fail_name = None  # only grab the first message line
+
+    # Collect failure names from inline indented ✖ lines (actual test entries)
+    failures: list[dict] = []
+    for line in lines:
+        # TAP outer: "not ok N - <description>"
         not_ok = re.match(r"\s*not ok\s+\d+\s*[-–]?\s*(.+)", line)
+        # Inline ✖: must be indented (suite-level ✖ lines have no leading space)
+        x_fail = re.match(r"( +)\u2716\s+(.+?)\s*\(\d+", line)
         if not_ok:
             name = not_ok.group(1).strip()
-            # Try to grab a message from the next non-blank line
-            message = ""
-            for j in range(i + 1, min(i + 6, len(lines))):
-                stripped = lines[j].strip()
-                if stripped and not stripped.startswith("#") and not stripped.startswith("not ok"):
-                    message = stripped
-                    break
-            failures.append({"name": name, "message": message})
+        elif x_fail:
+            name = x_fail.group(2).strip()
+        else:
+            continue
+        message = assertion_map.get(name, "")
+        failures.append({"name": name, "message": message})
 
     # Step 4 — passed = True only when exit code is 0 AND fail count is 0
     passed = result.returncode == 0 and fail_count == 0
