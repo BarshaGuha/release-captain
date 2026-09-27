@@ -82,6 +82,20 @@ def _node_version_ok() -> bool:
     return False
 
 
+def _node_version_str() -> str:
+    """Return the raw version string of the node currently on PATH, or 'not found'."""
+    try:
+        r = subprocess.run(
+            ["node", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "not found"
+
+
 def _inject_node_bin_to_path() -> None:
     """Prepend the extracted Node 22 bin/ dir to os.environ['PATH']."""
     if _NODE_BIN_DIR not in os.environ.get("PATH", ""):
@@ -137,9 +151,24 @@ def _ensure_node() -> None:
         finally:
             os.unlink(tmp_path)
 
-    # Write sentinel, inject PATH, then re-render with node available.
-    open(_NODE_SENTINEL, "w").close()
+    # Inject the new bin dir so _node_version_ok() sees the fresh binary.
     _inject_node_bin_to_path()
+
+    # Sanity-check: confirm the extracted binary is actually >=22 before
+    # writing the sentinel.  If it isn't, stop with a clear, actionable
+    # error rather than letting `npm test` fail silently on the wrong flag.
+    if not _node_version_ok():
+        found = _node_version_str()
+        st.error(
+            f"❌ Node.js >=22 is required (target repo uses "
+            f"`--experimental-strip-types`, which Node 22+ added), but the "
+            f"installed binary reports **{found}**.  "
+            f"Delete `{_NODE_SENTINEL}` (if present) and redeploy so the "
+            f"correct tarball is fetched."
+        )
+        st.stop()
+
+    open(_NODE_SENTINEL, "w").close()
     st.success("✅ Node.js 22 installed.")
     st.rerun()
 
