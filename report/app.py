@@ -19,6 +19,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
 
 # Ensure the repo root is on sys.path so `import orchestrator` and
 # `from subagents import ...` resolve correctly when Streamlit runs
@@ -52,62 +55,59 @@ DEFAULT_BRANCH_LABEL = "release/v1.2.0 (GO scenario)"
 
 
 # ---------------------------------------------------------------------------
-# System bootstrap — install Node 22 via nvm (no root required)
+# System bootstrap — install Node 22 LTS from official tarball (no root)
 # ---------------------------------------------------------------------------
 
-_HOME          = os.path.expanduser("~")
-_NVM_DIR       = os.path.join(_HOME, ".nvm")
-_NODE_SENTINEL = os.path.join(_HOME, ".node22_installed")
-# After nvm installs Node 22, the binary lands here:
-_NODE_BIN_DIR  = os.path.join(_NVM_DIR, "versions", "node", "v22", "bin")
+_NODE_VERSION  = "v22.14.0"
+_NODE_TARBALL  = f"node-{_NODE_VERSION}-linux-x64.tar.xz"
+_NODE_URL      = f"https://nodejs.org/dist/{_NODE_VERSION}/{_NODE_TARBALL}"
+# Install into a private directory under the user's home so no root is needed.
+_NODE_INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".local", "node22")
+_NODE_BIN_DIR     = os.path.join(_NODE_INSTALL_DIR, f"node-{_NODE_VERSION}-linux-x64", "bin")
+_NODE_SENTINEL    = os.path.join(os.path.expanduser("~"), ".node22_installed")
 
 
 def _node_version_ok() -> bool:
-    """Return True if `node` on PATH is version 22+."""
-    for node_cmd in ["node", os.path.join(_NODE_BIN_DIR, "node")]:
-        try:
-            r = subprocess.run(
-                [node_cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                major = int(r.stdout.strip().lstrip("v").split(".")[0])
-                if major >= 22:
-                    return True
-        except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-            continue
+    """Return True if the first `node` reachable on PATH is version >=22."""
+    try:
+        r = subprocess.run(
+            ["node", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            major = int(r.stdout.strip().lstrip("v").split(".")[0])
+            return major >= 22
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        pass
     return False
 
 
-def _inject_nvm_node_to_path() -> None:
-    """Prepend the nvm-installed Node 22 bin dir to os.environ['PATH']."""
-    # nvm may have installed into a versioned subdirectory — find it
-    versions_root = os.path.join(_NVM_DIR, "versions", "node")
-    node_bin = None
-    if os.path.isdir(versions_root):
-        candidates = sorted(
-            [d for d in os.listdir(versions_root) if d.startswith("v22")],
-            reverse=True,
-        )
-        if candidates:
-            node_bin = os.path.join(versions_root, candidates[0], "bin")
-    if node_bin and node_bin not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = node_bin + os.pathsep + os.environ.get("PATH", "")
+def _inject_node_bin_to_path() -> None:
+    """Prepend the extracted Node 22 bin/ dir to os.environ['PATH']."""
+    if _NODE_BIN_DIR not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _NODE_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
 
 
 def _ensure_node() -> None:
-    """Install Node.js 22 via nvm if it isn't available.
+    """Make Node.js 22 available without root or apt-get.
 
-    nvm installs entirely into ~/.nvm — no root, no apt, no system writes.
-    Only runs once per Cloud instance (sentinel file guards repeat installs).
-    On a developer's machine where node >=22 is already present this is a
-    no-op (the version check exits immediately).
+    Fast path: if `node --version` already reports >=22 (e.g. on a developer
+    machine) this is a complete no-op.
+
+    Otherwise the official Linux x64 tarball is downloaded once from
+    nodejs.org using Python's urllib, extracted with Python's tarfile module
+    into ~/.local/node22 (a directory the process already owns), and its bin/
+    directory is prepended to PATH for the lifetime of this Python process.
+
+    A sentinel file prevents the download/extraction from running more than
+    once per Cloud instance (cold-start guard).
     """
-    # Inject nvm node bin dir into PATH on every run (cheap, idempotent)
-    _inject_nvm_node_to_path()
+    # On every start, try to inject the bin dir in case a previous cold start
+    # already installed Node — this is cheap and idempotent.
+    _inject_node_bin_to_path()
 
     if _node_version_ok():
-        return   # already good — fast path
+        return  # fast path: node >=22 already on PATH
 
     if os.path.exists(_NODE_SENTINEL):
         st.error(
@@ -116,28 +116,24 @@ def _ensure_node() -> None:
         )
         st.stop()
 
-    st.info("⏳ Installing Node.js 22 via nvm — this only happens on the first cold start…")
-    with st.spinner("Installing nvm…"):
-        subprocess.run(
-            "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash",
-            shell=True,
-            check=True,
-            env={**os.environ, "NVM_DIR": _NVM_DIR},
-        )
+    st.info("⏳ Downloading Node.js 22 LTS — this only happens on the first cold start…")
 
-    with st.spinner("Installing Node.js 22 (nvm install 22)…"):
-        # Source nvm then install — must run in a login shell so nvm is on PATH
-        subprocess.run(
-            f'. "{_NVM_DIR}/nvm.sh" && nvm install 22 && nvm use 22',
-            shell=True,
-            check=True,
-            executable="/bin/bash",
-            env={**os.environ, "NVM_DIR": _NVM_DIR},
-        )
+    os.makedirs(_NODE_INSTALL_DIR, exist_ok=True)
 
-    # Write sentinel and inject the new bin dir before rerunning
+    with st.spinner(f"Downloading {_NODE_TARBALL} from nodejs.org…"):
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.xz")
+        os.close(tmp_fd)
+        try:
+            urllib.request.urlretrieve(_NODE_URL, tmp_path)
+            with st.spinner("Extracting Node.js 22…"):
+                with tarfile.open(tmp_path, "r:xz") as tf:
+                    tf.extractall(_NODE_INSTALL_DIR)
+        finally:
+            os.unlink(tmp_path)
+
+    # Write sentinel, inject PATH, then re-render with node available.
     open(_NODE_SENTINEL, "w").close()
-    _inject_nvm_node_to_path()
+    _inject_node_bin_to_path()
     st.success("✅ Node.js 22 installed.")
     st.rerun()
 
