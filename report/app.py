@@ -110,11 +110,12 @@ def _ensure_node() -> None:
         return  # fast path: node >=22 already on PATH
 
     if os.path.exists(_NODE_SENTINEL):
-        st.error(
-            "Node.js 22 install was attempted but `node` is still not available. "
-            "Check the app logs via Manage app → Logs."
-        )
-        st.stop()
+        # A previous attempt wrote the sentinel but node is still missing
+        # (e.g. nvm tried to compile from source and was OOM-killed, or the
+        # tarball extraction was interrupted).  Remove the stale sentinel and
+        # fall through to try again — this makes cold-start failures
+        # self-healing rather than permanently broken.
+        os.remove(_NODE_SENTINEL)
 
     st.info("⏳ Downloading Node.js 22 LTS — this only happens on the first cold start…")
 
@@ -127,7 +128,12 @@ def _ensure_node() -> None:
             urllib.request.urlretrieve(_NODE_URL, tmp_path)
             with st.spinner("Extracting Node.js 22…"):
                 with tarfile.open(tmp_path, "r:xz") as tf:
-                    tf.extractall(_NODE_INSTALL_DIR)
+                    # filter="data" is required on Python >=3.12 to avoid
+                    # DeprecationWarning-as-error; safe on older versions too.
+                    tf.extractall(
+                        _NODE_INSTALL_DIR,
+                        filter="data" if sys.version_info >= (3, 12) else None,
+                    )
         finally:
             os.unlink(tmp_path)
 
