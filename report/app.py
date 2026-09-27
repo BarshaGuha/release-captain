@@ -17,6 +17,7 @@ Expected shape:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 # Ensure the repo root is on sys.path so `import orchestrator` and
@@ -35,24 +36,78 @@ import streamlit as st
 # Override via environment variables for deployment on other repos.
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_PATH         = os.environ.get("RC_REPO_PATH",      os.path.join(_HERE, "..", "release-captain-target"))
-SINCE_REF         = os.environ.get("RC_SINCE_REF",      "763d71b")
-REQUIREMENTS_PATH = os.environ.get("RC_REQUIREMENTS",   "requirements.md")
-TEST_COMMAND      = os.environ.get("RC_TEST_COMMAND",    None)   # None → read from package.json
+REPO_PATH         = os.environ.get("RC_REPO_PATH",    os.path.join(_HERE, "..", "release-captain-target"))
+REPO_PATH         = os.path.abspath(REPO_PATH)
+TARGET_CLONE_URL  = "https://github.com/BarshaGuha/release-captain-target.git"
+SINCE_REF         = os.environ.get("RC_SINCE_REF",    "763d71b")
+REQUIREMENTS_PATH = os.environ.get("RC_REQUIREMENTS", "requirements.md")
+TEST_COMMAND      = os.environ.get("RC_TEST_COMMAND",  None)   # None → read from package.json
+
+# Branch choices shown in the UI
+BRANCH_OPTIONS = {
+    "release/v1.2.0 (GO scenario)":           "release/v1.2.0",
+    "release/v1.2.0-regression (NO-GO scenario)": "release/v1.2.0-regression",
+}
+DEFAULT_BRANCH_LABEL = "release/v1.2.0 (GO scenario)"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Repo bootstrap — clone + npm install if the folder doesn't exist
 # ---------------------------------------------------------------------------
 
-def _run() -> dict:
+def _ensure_repo() -> None:
+    """Clone the target repo if it isn't already present, then npm install."""
+    if not os.path.isdir(REPO_PATH):
+        st.info("⏳ Cloning target repo — this only happens once on first run…")
+        with st.spinner("Cloning target repo from GitHub…"):
+            subprocess.run(
+                ["git", "clone", TARGET_CLONE_URL, REPO_PATH],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        with st.spinner("Installing Node dependencies (npm install)…"):
+            subprocess.run(
+                ["npm", "install"],
+                cwd=REPO_PATH,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        st.success("✅ Repo cloned and dependencies installed.")
+        st.rerun()   # re-render now that the folder exists
+
+
+def _checkout_branch(branch: str) -> None:
+    """Check out *branch* in the target repo (fetch first to ensure it's present)."""
+    subprocess.run(
+        ["git", "fetch", "--all"],
+        cwd=REPO_PATH, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", branch],
+        cwd=REPO_PATH, check=True, capture_output=True, text=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release check runner
+# ---------------------------------------------------------------------------
+
+def _run(branch: str) -> dict:
+    _checkout_branch(branch)
+    req_path = os.path.join(REPO_PATH, REQUIREMENTS_PATH)
     return orchestrator.run_release_check(
         repo_path=REPO_PATH,
         since_ref=SINCE_REF,
-        requirements_path=REQUIREMENTS_PATH,
+        requirements_path=req_path,
         test_command=TEST_COMMAND,
     )
 
+
+# ---------------------------------------------------------------------------
+# Render helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def _render_verdict(report: dict) -> None:
     verdict = report["verdict"]
@@ -62,9 +117,9 @@ def _render_verdict(report: dict) -> None:
     col_v, col_d, col_t = st.columns([2, 1, 2])
     with col_v:
         if verdict == "GO":
-            st.success(f"## ✅ GO — ready to ship", icon=None)
+            st.success("## ✅ GO — ready to ship", icon=None)
         else:
-            st.error(f"## ❌ NO-GO — do not ship", icon=None)
+            st.error("## ❌ NO-GO — do not ship", icon=None)
     with col_d:
         st.metric("Run duration", f"{duration}s")
     with col_t:
@@ -165,7 +220,7 @@ def _render_spec(data: dict) -> None:
                 "Summary": r["text"][:80] + ("…" if len(r["text"]) > 80 else ""),
                 "Evidence": r["evidence"],
             })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _render_rollback(text: str) -> None:
@@ -179,15 +234,34 @@ def _render_rollback(text: str) -> None:
 st.set_page_config(page_title="Release Captain", page_icon="🚢", layout="wide")
 
 st.title("🚢 Release Captain")
+
+# ── Ensure the target repo exists (clone on first run) ────────────────────
+_ensure_repo()
+
+# ── Branch selector ───────────────────────────────────────────────────────
+st.markdown("**Select a scenario to check:**")
+branch_label = st.radio(
+    label="Branch",
+    options=list(BRANCH_OPTIONS.keys()),
+    index=0,
+    horizontal=True,
+    label_visibility="collapsed",
+)
+selected_branch = BRANCH_OPTIONS[branch_label]
+
 st.caption(
-    f"Checking `{os.path.basename(os.path.abspath(REPO_PATH))}` "
+    f"Checking `release-captain-target` · branch `{selected_branch}` "
     f"· since `{SINCE_REF}` · requirements: `{REQUIREMENTS_PATH}`"
 )
 
-# Run on first load; "Run again" re-triggers by clearing session state
-if "report" not in st.session_state:
-    with st.spinner("Running release check…"):
-        st.session_state["report"] = _run()
+# ── Run check — re-run whenever the branch selection changes ──────────────
+if (
+    "report" not in st.session_state
+    or st.session_state.get("last_branch") != selected_branch
+):
+    with st.spinner(f"Running release check on `{selected_branch}`…"):
+        st.session_state["report"] = _run(selected_branch)
+        st.session_state["last_branch"] = selected_branch
 
 report = st.session_state["report"]
 
