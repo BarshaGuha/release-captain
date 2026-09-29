@@ -38,11 +38,25 @@ import subprocess
 import time
 from pathlib import Path
 
+# An unattended run must never hang indefinitely on a stuck install or a
+# suite with a runaway test — a timeout turns that into a clear, reported
+# failure (and, via the orchestrator's blocking rule, a NO-GO) instead of a
+# process that never returns.
+_INSTALL_TIMEOUT_SECONDS = 300   # 5 min
+_TEST_RUN_TIMEOUT_SECONDS = 600  # 10 min
 
-def run(repo_path: str, test_command: str | None = None) -> dict:
+
+def run(
+    repo_path: str,
+    test_command: str | None = None,
+    install_timeout: float = _INSTALL_TIMEOUT_SECONDS,
+    test_timeout: float = _TEST_RUN_TIMEOUT_SECONDS,
+) -> dict:
     """Run the test suite and return a structured results dict.
 
     If *test_command* is None, reads scripts.test from the repo's package.json.
+    Raises RuntimeError (caught by the orchestrator as a subagent error, which
+    forces NO-GO) if install or the test run itself times out.
     """
     repo = Path(repo_path)
 
@@ -55,12 +69,19 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
     # Only runs on a cold environment; skipped once the tree is present so
     # the timing numbers reported to the orchestrator aren't inflated.
     if not (repo / "node_modules").exists():
-        install = subprocess.run(
-            ["npm", "install"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-        )
+        try:
+            install = subprocess.run(
+                ["npm", "install"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=install_timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"npm install in {repo} did not finish within {install_timeout}s "
+                f"(hung install, not a normal failure)."
+            ) from e
         if install.returncode != 0:
             raise RuntimeError(
                 f"npm install failed in {repo}:\n{install.stderr.strip()}"
@@ -68,13 +89,22 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
 
     # Step 2b — run the command, capturing stdout+stderr, timing wall-clock
     start = time.perf_counter()
-    result = subprocess.run(
-        test_command,
-        shell=True,
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            test_command,
+            shell=True,
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=test_timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or "") + (e.stderr or "")).strip()
+        tail = "\n".join(partial.splitlines()[-40:]) if partial else "(no output captured)"
+        raise RuntimeError(
+            f"Test command `{test_command}` in {repo} did not finish within "
+            f"{test_timeout}s and was killed. Last output:\n{tail}"
+        ) from e
     duration = time.perf_counter() - start
 
     combined = result.stdout + result.stderr

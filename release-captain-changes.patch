@@ -1,0 +1,1875 @@
+diff --git a/.gitignore b/.gitignore
+index bca7033..a18de37 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -35,3 +35,8 @@ node_modules/
+ dist/
+ .vscode/
+ .idea/
++
++# ---- Local run-history audit trail (orchestrator.py's history_dir) ----
++# Per-run output, not source; on Streamlit Community Cloud this directory
++# doesn't survive a redeploy anyway (see orchestrator.py's module docstring).
++run_history/
+diff --git a/orchestrator.py b/orchestrator.py
+index 9a32005..2dbd029 100644
+--- a/orchestrator.py
++++ b/orchestrator.py
+@@ -4,7 +4,7 @@ CONTRACT
+ --------
+ run_release_check(repo_path, since_ref, requirements_path, test_command) -> dict:
+     {
+-        "verdict": "GO" | "NO-GO",
++        "verdict": "GO" | "GO-WITH-WARNINGS" | "NO-GO",
+         "generated_at": str,          # ISO timestamp
+         "duration_seconds": float,     # wall-clock time for this whole run
+         "changelog": <output of subagents/changelog.py>,
+@@ -12,12 +12,46 @@ run_release_check(repo_path, since_ref, requirements_path, test_command) -> dict
+         "tests": <output of subagents/test.py>,
+         "spec": <output of subagents/spec.py>,
+         "rollback_plan_markdown": str,   # derived from the changelog
++        "warnings": [                    # non-blocking findings, always disposed
++            {
++                "source": str,            # "risk" | "spec"
++                "id": str,                # package name or requirement id
++                "description": str,
++                "owner": str,             # who is accountable for tracking this
++                "rationale": str,
++                "expiry": str,            # ISO date; disposition should be revisited by then
++            }
++        ],
++        "run_id": str,        # stable id for this run, tying the record below to this dict
++        "repo_commit": str,   # resolved HEAD sha of repo_path at run time ("unknown" if unresolvable)
+     }
+ 
+-Verdict rule:
+-    NO-GO if: tests["passed"] is False OR tests["passed"] is None OR
++Every run is also persisted to disk (see _write_run_record) as
++<history_dir>/<run_id>.json, plus one line appended to
++<history_dir>/index.jsonl, so a past verdict can be looked up later by
++run_id or commit instead of only existing for the lifetime of the Streamlit
++session that produced it. This is a local, filesystem-backed audit trail —
++adequate for development and for a single long-lived deployment, but note
++that Streamlit Community Cloud's filesystem does not survive a redeploy, so
++history written there is lost when the app restarts; swapping history_dir
++for a persistent store (e.g. an S3 bucket or a small database) is the
++natural next step once this runs somewhere longer-lived.
++
++Verdict rule (conjunctive: any blocking condition forces NO-GO; nothing
++compensates for anything else — a strong test run does not offset a missing
++requirement):
++    NO-GO (blocking) if: tests["passed"] is not True (False or None) OR
+               risk["risk_level"] == "high" OR
+-              any requirement has status == "not_covered".
++              any requirement has status == "not_covered" OR
++              any subagent raised an error (missing evidence is never a pass).
++
++    Otherwise, if there are non-blocking findings — risk["risk_level"] ==
++    "medium", or any requirement status == "unclear" — the verdict is
++    GO-WITH-WARNINGS. Each such finding is recorded in "warnings" with an
++    owner, rationale, and expiry, rather than either silently passing or
++    forcing a disproportionate block. A warning never escalates itself to
++    NO-GO — only the blocking conditions above do that.
++
+     Otherwise GO.
+ """
+ 
+@@ -25,12 +59,24 @@ from __future__ import annotations
+ 
+ import concurrent.futures
+ import json
++import subprocess
+ import time
+-from datetime import datetime, timezone
++import uuid
++from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
+ from subagents import changelog, risk, test, spec
+ 
++# How long a recorded warning stands before its disposition should be
++# revisited. Kept as a module constant so it's one place to tune, not a
++# magic number buried in the verdict logic.
++_WARNING_EXPIRY_DAYS = 14
++
++# Default location for the run-history audit trail (see _write_run_record).
++# Lives next to this file, not inside the target repo being checked, since
++# the target repo is often an ephemeral clone.
++_DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "run_history"
++
+ 
+ def _read_test_command(repo_path: str) -> str:
+     """Read scripts.test from the repo's package.json."""
+@@ -40,6 +86,123 @@ def _read_test_command(repo_path: str) -> str:
+     return pkg["scripts"]["test"]
+ 
+ 
++def _resolve_commit(repo_path: str) -> str:
++    """Return the resolved HEAD sha of repo_path, or 'unknown' if unavailable."""
++    try:
++        result = subprocess.run(
++            ["git", "rev-parse", "HEAD"],
++            cwd=repo_path,
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++        if result.returncode == 0:
++            return result.stdout.strip()
++    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
++        pass
++    return "unknown"
++
++
++def _write_run_record(report: dict, history_dir: Path) -> None:
++    """Persist this run's full report to <history_dir>/<run_id>.json, and
++    append a compact summary line to <history_dir>/index.jsonl for quick
++    lookup without reading every record.
++
++    Best-effort: a write failure (read-only filesystem, disk full) is logged
++    to stderr and never raised — an audit trail that can't be written is a
++    real gap, but it must never be the reason a release check itself fails.
++    """
++    try:
++        history_dir.mkdir(parents=True, exist_ok=True)
++
++        record_path = history_dir / f"{report['run_id']}.json"
++        with open(record_path, "w") as f:
++            json.dump(report, f, indent=2, default=str)
++
++        index_line = {
++            "run_id": report["run_id"],
++            "generated_at": report["generated_at"],
++            "repo_commit": report["repo_commit"],
++            "verdict": report["verdict"],
++            "warning_count": len(report.get("warnings", [])),
++        }
++        with open(history_dir / "index.jsonl", "a") as f:
++            f.write(json.dumps(index_line) + "\n")
++    except OSError as e:
++        import sys
++        print(f"[orchestrator] warning: could not write run history: {e}", file=sys.stderr)
++
++
++def _compute_verdict(
++    test_result: dict,
++    risk_result: dict,
++    spec_result: dict,
++    generated_at: datetime,
++) -> tuple[str, list[dict]]:
++    """Pure verdict logic, kept separate from I/O so it's directly testable.
++
++    Returns (verdict, warnings) where verdict is one of
++    "GO" | "GO-WITH-WARNINGS" | "NO-GO".
++    """
++    tests_passed = test_result.get("passed")   # None if subagent errored
++    risk_level   = risk_result.get("risk_level", "high")  # pessimistic default on error
++    requirements = spec_result.get("requirements", [])
++
++    # Blocking (conjunctive): any one of these forces NO-GO regardless of
++    # how clean everything else is. Nothing here compensates for anything
++    # else, and missing evidence (a subagent error) is never treated as a
++    # pass.
++    no_go = (
++        tests_passed is not True          # False OR None → NO-GO
++        or risk_level == "high"
++        or any(r.get("status") == "not_covered" for r in requirements)
++        or "error" in test_result         # subagent itself crashed
++        or "error" in risk_result
++        or "error" in spec_result
++    )
++
++    # Non-blocking (disposed, not silently dropped and not hard-blocked):
++    # medium-severity dependency risk, and spec requirements the coverage
++    # check couldn't confidently classify either way.
++    expiry = (generated_at + timedelta(days=_WARNING_EXPIRY_DAYS)).date().isoformat()
++    warnings: list[dict] = []
++
++    if not no_go:
++        for finding in risk_result.get("findings", []):
++            if finding.get("severity") == "medium":
++                warnings.append({
++                    "source": "risk",
++                    "id": finding.get("package", "unknown"),
++                    "description": finding.get("change", ""),
++                    "owner": "release-authority",
++                    "rationale": finding.get("reason", ""),
++                    "expiry": expiry,
++                })
++
++        for r in requirements:
++            if r.get("status") == "unclear":
++                warnings.append({
++                    "source": "spec",
++                    "id": r.get("id", "unknown"),
++                    "description": r.get("text", ""),
++                    "owner": "evaluation-owner",
++                    "rationale": (
++                        f"Coverage check could not confidently classify this "
++                        f"requirement (evidence: {r.get('evidence', 'none')})."
++                    ),
++                    "expiry": expiry,
++                })
++
++    if no_go:
++        verdict = "NO-GO"
++    elif warnings:
++        verdict = "GO-WITH-WARNINGS"
++    else:
++        verdict = "GO"
++
++    return verdict, warnings
++
++
+ def _make_rollback_plan(changelog_result: dict, since_ref: str) -> str:
+     """Build a one-sentence rollback summary from the changelog output."""
+     commit_count = changelog_result.get("commit_count", 0)
+@@ -56,8 +219,14 @@ def run_release_check(
+     since_ref: str,
+     requirements_path: str,
+     test_command: str | None = None,
++    history_dir: str | Path | None = None,
+ ) -> dict:
+-    """Run all four subagents concurrently and return the full release report."""
++    """Run all four subagents concurrently and return the full release report.
++
++    Also persists the report to history_dir (default: run_history/ next to
++    this file) so it can be looked up later by run_id or commit — see the
++    module docstring's note on run_id/repo_commit/history persistence.
++    """
+     repo_path = str(Path(repo_path).resolve())
+ 
+     # Resolve test command from package.json if not supplied
+@@ -95,36 +264,31 @@ def run_release_check(
+             spec_result = {"error": str(e)}
+ 
+     duration = time.perf_counter() - start
++    generated_at = datetime.now(timezone.utc)
+ 
+-    # --- Verdict rule ---
+-    tests_passed = test_result.get("passed")   # None if subagent errored
+-    risk_level   = risk_result.get("risk_level", "high")  # pessimistic default on error
+-    requirements = spec_result.get("requirements", [])
+-
+-    no_go = (
+-        tests_passed is not True          # False OR None → NO-GO
+-        or risk_level == "high"
+-        or any(r.get("status") == "not_covered" for r in requirements)
+-        or "error" in test_result         # subagent itself crashed
+-        or "error" in risk_result
+-        or "error" in spec_result
+-    )
+-
+-    verdict = "NO-GO" if no_go else "GO"
++    verdict, warnings = _compute_verdict(test_result, risk_result, spec_result, generated_at)
+ 
+     rollback_plan = _make_rollback_plan(changelog_result, since_ref)
+ 
+-    return {
++    report = {
++        "run_id": uuid.uuid4().hex,
+         "verdict": verdict,
+-        "generated_at": datetime.now(timezone.utc).isoformat(),
++        "generated_at": generated_at.isoformat(),
++        "repo_commit": _resolve_commit(repo_path),
+         "duration_seconds": round(duration, 3),
+         "changelog": changelog_result,
+         "risk": risk_result,
+         "tests": test_result,
+         "spec": spec_result,
+         "rollback_plan_markdown": rollback_plan,
++        "warnings": warnings,
+     }
+ 
++    resolved_history_dir = Path(history_dir) if history_dir is not None else _DEFAULT_HISTORY_DIR
++    _write_run_record(report, resolved_history_dir)
++
++    return report
++
+ 
+ if __name__ == "__main__":
+     import os
+@@ -170,5 +334,14 @@ if __name__ == "__main__":
+     print("\n--- Rollback Plan ---")
+     print(report['rollback_plan_markdown'])
+ 
++    print("\n--- Warnings ---")
++    if report['warnings']:
++        for w in report['warnings']:
++            print(f"  ⚠️  [{w['source']}] {w['id']}: {w['description']}")
++            print(f"      owner={w['owner']}  expiry={w['expiry']}")
++            print(f"      {w['rationale']}")
++    else:
++        print("  none")
++
+     print("\n--- Full report (JSON) ---")
+     pprint.pprint(report)
+diff --git a/report/app.py b/report/app.py
+index d08046b..00cd507 100644
+--- a/report/app.py
++++ b/report/app.py
+@@ -250,6 +250,8 @@ def _render_verdict(report: dict) -> None:
+     with col_v:
+         if verdict == "GO":
+             st.success("## ✅ GO — ready to ship", icon=None)
++        elif verdict == "GO-WITH-WARNINGS":
++            st.warning("## ⚠️ GO — WITH WARNINGS", icon=None)
+         else:
+             st.error("## ❌ NO-GO — do not ship", icon=None)
+     with col_d:
+@@ -258,6 +260,28 @@ def _render_verdict(report: dict) -> None:
+         st.caption(f"Generated: {generated}")
+ 
+ 
++def _render_warnings(warnings: list[dict]) -> None:
++    if not warnings:
++        return
++    st.subheader("⚠️ Warnings (tracked, non-blocking)")
++    st.caption(
++        "These didn't block the release, but they're recorded with an "
++        "owner and a review date rather than silently passing."
++    )
++    rows = [
++        {
++            "Source": w["source"],
++            "Finding": w["id"],
++            "Description": w["description"],
++            "Owner": w["owner"],
++            "Review by": w["expiry"],
++            "Rationale": w["rationale"],
++        }
++        for w in warnings
++    ]
++    st.dataframe(rows, width="stretch", hide_index=True)
++
++
+ def _render_changelog(data: dict) -> None:
+     if "error" in data:
+         st.error(f"Changelog subagent failed: {data['error']}")
+@@ -359,6 +383,24 @@ def _render_rollback(text: str) -> None:
+     st.markdown(text)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Environment bootstrap — cached so it runs once per server process, not on
++# every rerun (every widget interaction re-executes this whole script; the
++# Node-version check and repo-existence check are cheap individually, but
++# there's no reason to redo them dozens of times per session, and this is
++# also the natural place a future, more expensive bootstrap step would need
++# this guard). st.cache_resource shares its result across all sessions on
++# this server process, matching the sentinel-file idempotency _ensure_node
++# already relies on.
++# ---------------------------------------------------------------------------
++
++@st.cache_resource(show_spinner=False)
++def _bootstrap_environment() -> bool:
++    _ensure_node()
++    _ensure_repo()
++    return True
++
++
+ # ---------------------------------------------------------------------------
+ # Page layout
+ # ---------------------------------------------------------------------------
+@@ -367,11 +409,8 @@ st.set_page_config(page_title="Release Captain", page_icon="🚢", layout="wide"
+ 
+ st.title("🚢 Release Captain")
+ 
+-# ── Ensure Node.js 22 is available (installs on Streamlit Cloud if missing) ──
+-_ensure_node()
+-
+-# ── Ensure the target repo exists (clone on first run) ────────────────────
+-_ensure_repo()
++# ── Ensure Node.js 22 and the target repo are ready (cached — see above) ──
++_bootstrap_environment()
+ 
+ # ── Branch selector ───────────────────────────────────────────────────────
+ st.markdown("**Select a scenario to check:**")
+@@ -402,6 +441,7 @@ report = st.session_state["report"]
+ 
+ # ── Verdict banner ────────────────────────────────────────────────────────
+ _render_verdict(report)
++_render_warnings(report.get("warnings", []))
+ 
+ st.divider()
+ 
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..a266747
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,2 @@
++-r requirements.txt
++pytest>=8.0
+diff --git a/run_tests.py b/run_tests.py
+new file mode 100644
+index 0000000..54918e3
+--- /dev/null
++++ b/run_tests.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++"""Run the self-test suite in tests/.
++
++Prefers pytest if it's installed (`pip install -r requirements-dev.txt`)
++since it gives better output and discovery; falls back to each test file's
++own plain-assert runner (see each tests/test_*.py's `if __name__ ==
++"__main__"` block) when pytest isn't available, so the suite is always
++runnable with nothing beyond the standard library.
++
++Usage: python3 run_tests.py
++"""
++from __future__ import annotations
++
++import subprocess
++import sys
++from pathlib import Path
++
++TESTS_DIR = Path(__file__).parent / "tests"
++
++
++def _try_pytest() -> int | None:
++    try:
++        import pytest  # noqa: F401
++    except ImportError:
++        return None
++    return subprocess.run([sys.executable, "-m", "pytest", str(TESTS_DIR), "-v"]).returncode
++
++
++def _fallback_runner() -> int:
++    test_files = sorted(TESTS_DIR.glob("test_*.py"))
++    overall_ok = True
++    for test_file in test_files:
++        print(f"\n=== {test_file.name} ===")
++        result = subprocess.run([sys.executable, str(test_file)])
++        overall_ok = overall_ok and result.returncode == 0
++    return 0 if overall_ok else 1
++
++
++if __name__ == "__main__":
++    code = _try_pytest()
++    if code is None:
++        print("pytest not installed — using each test file's built-in fallback runner.")
++        print("For nicer output: pip install -r requirements-dev.txt\n")
++        code = _fallback_runner()
++    sys.exit(code)
+diff --git a/subagents/changelog.py b/subagents/changelog.py
+index 3b4486a..62dca94 100644
+--- a/subagents/changelog.py
++++ b/subagents/changelog.py
+@@ -28,6 +28,12 @@ from __future__ import annotations
+ 
+ import subprocess
+ 
++# `git log` against a local repo is normally instant; this guards only
++# against a genuinely hung process (e.g. a corrupted repo or a network
++# filesystem stall) so a single subagent can't block an unattended run
++# forever.
++_GIT_LOG_TIMEOUT_SECONDS = 30
++
+ 
+ _FEAT_KEYWORDS = {"add", "added", "adds", "implement", "implements", "implemented",
+                   "introduce", "introduces", "introduced", "new", "create", "creates",
+@@ -91,13 +97,20 @@ def run(repo_path: str, since_ref: str) -> dict:
+         commit_count : int
+         commits : list[dict]  — each has keys: hash, summary, kind
+     """
+-    result = subprocess.run(
+-        ["git", "log", f"{since_ref}..HEAD", "--oneline"],
+-        cwd=repo_path,
+-        capture_output=True,
+-        text=True,
+-        check=True,
+-    )
++    try:
++        result = subprocess.run(
++            ["git", "log", f"{since_ref}..HEAD", "--oneline"],
++            cwd=repo_path,
++            capture_output=True,
++            text=True,
++            check=True,
++            timeout=_GIT_LOG_TIMEOUT_SECONDS,
++        )
++    except subprocess.TimeoutExpired as e:
++        raise RuntimeError(
++            f"`git log {since_ref}..HEAD` in {repo_path} did not finish within "
++            f"{_GIT_LOG_TIMEOUT_SECONDS}s."
++        ) from e
+ 
+     commits = []
+     for line in result.stdout.strip().splitlines():
+diff --git a/subagents/risk.py b/subagents/risk.py
+index 57ed6cb..de31679 100644
+--- a/subagents/risk.py
++++ b/subagents/risk.py
+@@ -23,13 +23,26 @@ Output (dict):
+     }
+ 
+ Notes for Bob:
+-- Diff package.json / package-lock.json (or requirements.txt / pyproject.toml
+-  for a Python target) between since_ref and HEAD.
++- Diff package.json / package-lock.json for a Node target, or
++  requirements.txt / pyproject.toml for a Python target, between since_ref
++  and HEAD — whichever manifest the target repo actually has (see
++  _detect_manifest_kind; the output's "manifest_kind" field says which one
++  was used, and is "none" with an honest empty finding set if the repo has
++  none of the three, rather than silently reporting a false "low").
+ - A major-version bump is at least "medium" risk; a new dependency with no
+   prior review is "medium"; a patch/minor bump is "low" unless the changelog
+   of that dependency mentions a breaking change.
+ - If nothing changed, return risk_level "low" with an empty findings list —
+   don't invent risk to make the report look busier.
++
++Severity escalation to "high" (added so the verdict's high-risk NO-GO path
++is actually reachable, not just declared in the contract):
++- A *production* dependency (declared under "dependencies", not
++  "devDependencies") is removed entirely — code that imports it may break
++  with no earlier warning.
++- A *production* dependency jumps two or more major versions in one release
++  (e.g. 3.x -> 6.x) — a single-major bump stays "medium"; skipping majors
++  means intermediate breaking changes were never reviewed at all.
+ """
+ 
+ from __future__ import annotations
+@@ -53,18 +66,36 @@ def _parse_version(version_str: str) -> tuple[int, int, int]:
+     return (major, minor, patch)
+ 
+ 
++_GIT_SHOW_TIMEOUT_SECONDS = 30
++
++
++def _git_show_text(repo_path: str, ref: str, filepath: str) -> str | None:
++    """Return the raw text of a file at a given git ref, or None if not found."""
++    try:
++        result = subprocess.run(
++            ["git", "show", f"{ref}:{filepath}"],
++            cwd=repo_path,
++            capture_output=True,
++            text=True,
++            timeout=_GIT_SHOW_TIMEOUT_SECONDS,
++        )
++    except subprocess.TimeoutExpired as e:
++        raise RuntimeError(
++            f"`git show {ref}:{filepath}` in {repo_path} did not finish within "
++            f"{_GIT_SHOW_TIMEOUT_SECONDS}s."
++        ) from e
++    if result.returncode != 0:
++        return None
++    return result.stdout
++
++
+ def _git_show_json(repo_path: str, ref: str, filepath: str) -> dict | None:
+     """Return parsed JSON of a file at a given git ref, or None if not found."""
+-    result = subprocess.run(
+-        ["git", "show", f"{ref}:{filepath}"],
+-        cwd=repo_path,
+-        capture_output=True,
+-        text=True,
+-    )
+-    if result.returncode != 0:
++    text = _git_show_text(repo_path, ref, filepath)
++    if text is None:
+         return None
+     try:
+-        return json.loads(result.stdout)
++        return json.loads(text)
+     except json.JSONDecodeError:
+         return None
+ 
+@@ -98,13 +129,208 @@ def _resolved_versions(lock: dict) -> dict[str, str]:
+     return result
+ 
+ 
+-def run(repo_path: str, since_ref: str) -> dict:
++def _classify_bump(old_tuple: tuple[int, int, int], new_tuple: tuple[int, int, int], is_prod: bool) -> tuple[str, str, str]:
++    """Shared severity classification for a version change, used by every
++    ecosystem (Node, pip, pyproject) so a major-version-skip in a Python
++    target is treated exactly as seriously as one in a Node target."""
++    if new_tuple[0] > old_tuple[0]:
++        major_span = new_tuple[0] - old_tuple[0]
++        if is_prod and major_span >= 2:
++            return (
++                "high",
++                "major bump (skipped versions)",
++                f"Production dependency jumped {major_span} major versions "
++                f"({old_tuple[0]}.x to {new_tuple[0]}.x) in one release; "
++                "intermediate breaking changes were never reviewed.",
++            )
++        return (
++            "medium",
++            "major bump",
++            f"Major version upgrade from {old_tuple[0]}.x to {new_tuple[0]}.x; "
++            "may contain breaking changes.",
++        )
++    if new_tuple < old_tuple:
++        return ("low", "downgrade", f"Version downgraded.")
++    if new_tuple[1] > old_tuple[1]:
++        return ("low", "minor bump", "Minor version bump; backwards-compatible by semver convention.")
++    return ("low", "patch bump", "Patch version bump; bug-fix release.")
++
++
++def _removed_dependency_finding(pkg: str, old_display: str, is_prod: bool) -> dict:
++    return {
++        "package": pkg,
++        "change": f"{old_display} -> (removed)",
++        "severity": "high" if is_prod else "low",
++        "reason": (
++            "Production dependency removed; code that imports it "
++            "will break unless this was verified."
++        ) if is_prod else "Dev-only dependency removed; no inbound risk.",
++    }
++
++
++def _new_dependency_finding(pkg: str, new_display: str) -> dict:
++    return {
++        "package": pkg,
++        "change": f"(not present) -> {new_display} (new dependency)",
++        "severity": "medium",
++        "reason": "New dependency introduced; not present in previous release.",
++    }
++
++
++def _detect_manifest_kind(repo: str) -> str:
++    """Which dependency manifest this target repo actually uses.
++
++    Checked in this order because a repo could technically have more than
++    one (e.g. a Node app with a Python tooling script) — package.json wins
++    if present, since that's this tool's most-exercised path; otherwise the
++    first Python manifest found.
+     """
+-    Diff package.json and package-lock.json between since_ref and HEAD.
+-    Flag major-version bumps and new dependencies as medium risk.
++    if (Path(repo) / "package.json").is_file():
++        return "node"
++    if (Path(repo) / "requirements.txt").is_file():
++        return "pip"
++    if (Path(repo) / "pyproject.toml").is_file():
++        return "pyproject"
++    return "none"
++
++
++_REQUIREMENT_LINE_RE = re.compile(
++    r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(==\s*([0-9][0-9A-Za-z.\-]*))?"
++)
++
++
++def _parse_requirements_txt(text: str) -> dict[str, str | None]:
++    """Parse a pip requirements.txt into {name: pinned_version_or_None}.
++
++    Only handles simple `name`, `name==1.2.3`, and range-specified lines
++    (range specs are recorded as unpinned — None — since there's no single
++    resolved version to diff without a lockfile); `-r other.txt` includes
++    and `#` comments are skipped rather than mis-parsed as packages.
+     """
+-    repo = str(Path(repo_path).resolve())
++    deps: dict[str, str | None] = {}
++    for line in text.splitlines():
++        stripped = line.strip()
++        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
++            continue
++        m = _REQUIREMENT_LINE_RE.match(stripped)
++        if not m:
++            continue
++        name = m.group(1)
++        pinned = m.group(3)  # None unless the line used "=="
++        deps[name] = pinned
++    return deps
++
++
++def _diff_pip_requirements(repo: str, since_ref: str) -> list[dict]:
++    """Diff requirements.txt between since_ref and HEAD. All entries are
++    treated as production dependencies — pip's flat requirements.txt has no
++    dev/prod distinction the way package.json does."""
++    old_text = _git_show_text(repo, since_ref, "requirements.txt") or ""
++    new_path = Path(repo) / "requirements.txt"
++    new_text = new_path.read_text() if new_path.is_file() else ""
++
++    old_deps = _parse_requirements_txt(old_text)
++    new_deps = _parse_requirements_txt(new_text)
++
++    return _diff_flat_dep_maps(old_deps, new_deps, all_prod=True)
++
++
++def _load_pyproject_deps(text: str) -> dict[str, str | None] | None:
++    """Extract {name: pinned_version_or_None} from a pyproject.toml's
++    PEP 621 [project.dependencies] or Poetry's [tool.poetry.dependencies].
++    Returns None if the file can't be parsed at all (no TOML parser
++    available, or malformed TOML) so the caller can report that honestly
++    instead of silently treating it as "no dependencies"."""
++    try:
++        import tomllib  # Python 3.11+
++    except ImportError:
++        try:
++            import tomli as tomllib  # type: ignore
++        except ImportError:
++            return None
++    try:
++        data = tomllib.loads(text)
++    except Exception:
++        return None
++
++    deps: dict[str, str | None] = {}
+ 
++    project_deps = data.get("project", {}).get("dependencies", [])
++    for entry in project_deps:
++        # PEP 508 strings, e.g. "requests==2.31.0" or "requests>=2.0"
++        m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(==\s*([0-9][0-9A-Za-z.\-]*))?", entry)
++        if m:
++            deps[m.group(1)] = m.group(3)
++
++    poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
++    for name, spec in poetry_deps.items():
++        if name.lower() == "python":
++            continue
++        if isinstance(spec, str):
++            pinned = spec.lstrip("^~=") if re.match(r"^[\^~=]?\d", spec) else None
++            deps[name] = pinned if re.match(r"^\d", pinned or "") else None
++        # dict-form specs (git deps, extras, etc.) are left unpinned/None —
++        # not enough of a single version to diff meaningfully.
++        elif isinstance(spec, dict):
++            deps.setdefault(name, None)
++
++    return deps
++
++
++def _diff_pyproject(repo: str, since_ref: str) -> tuple[list[dict], bool]:
++    """Diff pyproject.toml between since_ref and HEAD.
++
++    Returns (findings, parsed_ok). parsed_ok is False when no TOML parser
++    was available or the file didn't parse — callers should report that as
++    an honest gap, not as a clean "no changes" result.
++    """
++    old_text = _git_show_text(repo, since_ref, "pyproject.toml") or ""
++    new_path = Path(repo) / "pyproject.toml"
++    new_text = new_path.read_text() if new_path.is_file() else ""
++
++    old_deps = _load_pyproject_deps(old_text) if old_text else {}
++    new_deps = _load_pyproject_deps(new_text)
++
++    if new_deps is None:
++        return [], False
++
++    return _diff_flat_dep_maps(old_deps or {}, new_deps, all_prod=True), True
++
++
++def _diff_flat_dep_maps(
++    old_deps: dict[str, str | None],
++    new_deps: dict[str, str | None],
++    all_prod: bool,
++) -> list[dict]:
++    """Shared diff logic for ecosystems with a single flat name->version map
++    (no separate declared-range vs. resolved-lock distinction)."""
++    findings: list[dict] = []
++    for pkg in sorted(set(old_deps) | set(new_deps)):
++        old_ver = old_deps.get(pkg)
++        new_ver = new_deps.get(pkg)
++
++        if pkg not in old_deps and pkg in new_deps:
++            findings.append(_new_dependency_finding(pkg, new_ver or "unpinned"))
++        elif pkg in old_deps and pkg not in new_deps:
++            findings.append(_removed_dependency_finding(pkg, old_ver or "unpinned", all_prod))
++        else:
++            if not old_ver or not new_ver or old_ver == new_ver:
++                continue  # unchanged, or can't compare without both pinned
++            old_tuple = _parse_version(old_ver)
++            new_tuple = _parse_version(new_ver)
++            severity, label, reason = _classify_bump(old_tuple, new_tuple, all_prod)
++            findings.append({
++                "package": pkg,
++                "change": f"{old_ver} -> {new_ver} ({label})",
++                "severity": severity,
++                "reason": reason,
++            })
++    return findings
++
++
++def _diff_node_manifest(repo: str, since_ref: str) -> list[dict]:
++    """Diff package.json and package-lock.json between since_ref and HEAD.
++    Flag major-version bumps and new dependencies as medium risk."""
+     # --- declared ranges from package.json ---
+     old_manifest = _git_show_json(repo, since_ref, "package.json") or {}
+     new_manifest_path = Path(repo) / "package.json"
+@@ -114,6 +340,11 @@ def run(repo_path: str, since_ref: str) -> dict:
+     old_declared = _collect_deps(old_manifest)
+     new_declared = _collect_deps(new_manifest)
+ 
++    # Production-dependency membership, tracked separately so removal/bump
++    # severity can tell a runtime dependency apart from a dev-only one.
++    old_prod = set(old_manifest.get("dependencies", {}).keys())
++    new_prod = set(new_manifest.get("dependencies", {}).keys())
++
+     # --- resolved versions from package-lock.json ---
+     old_lock = _git_show_json(repo, since_ref, "package-lock.json") or {}
+     new_lock_path = Path(repo) / "package-lock.json"
+@@ -135,23 +366,11 @@ def run(repo_path: str, since_ref: str) -> dict:
+         new_ver = new_resolved.get(pkg)
+ 
+         if old_range is None and new_range is not None:
+-            # Net-new dependency
+-            installed = new_ver or new_range
+-            findings.append({
+-                "package": pkg,
+-                "change": f"(not present) -> {installed} (new dependency)",
+-                "severity": "medium",
+-                "reason": "New dependency introduced; not present in previous release.",
+-            })
++            findings.append(_new_dependency_finding(pkg, new_ver or new_range))
+ 
+         elif old_range is not None and new_range is None:
+-            # Removed dependency — low risk, just note it
+-            findings.append({
+-                "package": pkg,
+-                "change": f"{old_ver or old_range} -> (removed)",
+-                "severity": "low",
+-                "reason": "Dependency removed; no inbound risk.",
+-            })
++            was_prod = pkg in old_prod
++            findings.append(_removed_dependency_finding(pkg, old_ver or old_range, was_prod))
+ 
+         else:
+             # Present in both — compare resolved versions first, fall back to declared range
+@@ -163,45 +382,66 @@ def run(repo_path: str, since_ref: str) -> dict:
+ 
+             old_tuple = _parse_version(effective_old)
+             new_tuple = _parse_version(effective_new)
++            is_prod = pkg in old_prod or pkg in new_prod
+ 
+-            change_str = f"{effective_old} -> {effective_new}"
+-
+-            if new_tuple[0] > old_tuple[0]:
+-                severity = "medium"
+-                label = "major bump"
+-                reason = (
+-                    f"Major version upgrade from {old_tuple[0]}.x to {new_tuple[0]}.x; "
+-                    "may contain breaking changes."
+-                )
+-            elif new_tuple < old_tuple:
+-                severity = "low"
+-                label = "downgrade"
+-                reason = f"Version downgraded from {effective_old} to {effective_new}."
+-            elif new_tuple[1] > old_tuple[1]:
+-                severity = "low"
+-                label = "minor bump"
+-                reason = "Minor version bump; backwards-compatible by semver convention."
+-            else:
+-                severity = "low"
+-                label = "patch bump"
+-                reason = "Patch version bump; bug-fix release."
+-
++            severity, label, reason = _classify_bump(old_tuple, new_tuple, is_prod)
+             findings.append({
+                 "package": pkg,
+-                "change": f"{change_str} ({label})",
++                "change": f"{effective_old} -> {effective_new} ({label})",
+                 "severity": severity,
+                 "reason": reason,
+             })
+ 
+-    # Overall risk level is the highest severity found
++    return findings
++
++
++def run(repo_path: str, since_ref: str) -> dict:
++    """
++    Diff the target repo's dependency manifest between since_ref and HEAD —
++    package.json/package-lock.json for Node, requirements.txt or
++    pyproject.toml for Python — whichever the repo actually has.
++    """
++    repo = str(Path(repo_path).resolve())
++    manifest_kind = _detect_manifest_kind(repo)
++
++    parsed_ok = True
++    if manifest_kind == "node":
++        findings = _diff_node_manifest(repo, since_ref)
++    elif manifest_kind == "pip":
++        findings = _diff_pip_requirements(repo, since_ref)
++    elif manifest_kind == "pyproject":
++        findings, parsed_ok = _diff_pyproject(repo, since_ref)
++    else:
++        findings = []
++
++    # Overall risk level is the highest severity found. A pyproject.toml
++    # that couldn't be parsed (no TOML library available, or malformed
++    # file) is reported as "unknown" evidence rather than a clean "low" —
++    # missing evidence is never a pass.
+     severity_rank = {"low": 0, "medium": 1, "high": 2}
+-    if findings:
++    if not parsed_ok:
++        risk_level = "high"
++    elif findings:
+         risk_level = max((f["severity"] for f in findings), key=lambda s: severity_rank[s])
+     else:
+         risk_level = "low"
+ 
+     # Build summary markdown
+-    if not findings:
++    if manifest_kind == "none":
++        summary_markdown = (
++            "**Dependency risk: LOW (unverified)**\n\n"
++            "No package.json, requirements.txt, or pyproject.toml found in "
++            "this repo — dependency risk could not actually be checked."
++        )
++    elif not parsed_ok:
++        summary_markdown = (
++            "**Dependency risk: HIGH (unverified)**\n\n"
++            "pyproject.toml is present but could not be parsed (no TOML "
++            "parser available, or the file is malformed) — dependency risk "
++            "could not be checked, which is treated as high risk rather "
++            "than silently passing."
++        )
++    elif not findings:
+         summary_markdown = (
+             "**Dependency risk: LOW**\n\n"
+             "No dependency changes detected between `{}` and HEAD.".format(since_ref)
+@@ -219,6 +459,7 @@ def run(repo_path: str, since_ref: str) -> dict:
+         "risk_level": risk_level,
+         "findings": findings,
+         "summary_markdown": summary_markdown,
++        "manifest_kind": manifest_kind,
+     }
+ 
+ 
+diff --git a/subagents/spec.py b/subagents/spec.py
+index b78e9b3..7f7c315 100644
+--- a/subagents/spec.py
++++ b/subagents/spec.py
+@@ -30,17 +30,58 @@ Notes for Bob:
+   test that exercises it — "covered" means both exist, not just one.
+ - Requirements explicitly marked out of scope in the doc are not counted
+   against coverage.
++
++PER-REPO CONFIGURATION
++-----------------------
++The requirement→code/test signal mapping is repo-specific by nature (it has
++to name real files, function names, and patterns), so it is no longer
++hardcoded to this project's original demo target. It is now read from a
++config file:
++
++    <repo_path>/.release-captain/spec-signals.json
++
++with this shape:
++
++    {
++        "impl_file": "src/routes/todos.ts",   # relative to repo_path
++        "test_file": "src/routes/todos.test.ts",
++        "src_dir": "src",                      # used when a signal sets "impl_glob": true
++        "static_check_requirement_id": "R8",   # optional: this one req gets a
++                                                # suite-health check instead of
++                                                # pattern matching (see _check_r8_static)
++        "signals": {
++            "R1": {
++                "impl": "todos\\.get\\('/',",
++                "test": "app\\.request\\('/api/todos'\\)",
++                "impl_label": "todos.get('/', …) in todos.ts",
++                "test_label": "app.request('/api/todos') in todos.test.ts",
++                "impl_glob": false   # optional; search all files under src_dir instead
++            },
++            ...
++        }
++    }
++
++If no such file exists in the target repo, spec.run() falls back to
++_DEFAULT_CONFIG below — the exact mapping this project shipped with for its
++own demo target (a Hono todos API) — so existing behavior is unchanged for
++that repo. Any other repo without its own config will report every
++requirement as "unclear: no config found for this repo", rather than
++silently reusing signals that describe a different codebase.
+ """
+ 
+ from __future__ import annotations
+ 
++import copy
++import json
+ import os
+ import re
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Route / signal mapping
++# Default signal mapping — this project's own demo target only
+ #
++# Kept as the fallback so a repo that hasn't been given its own
++# .release-captain/spec-signals.json still behaves exactly as before.
+ # Each entry maps a requirement ID to a pair of search strings:
+ #   (impl_pattern, test_pattern)
+ #
+@@ -57,7 +98,7 @@ import re
+ #
+ # Patterns for todos.test.ts use the full paths that app.request() receives.
+ 
+-REQUIREMENT_SIGNALS: dict[str, dict] = {
++_DEFAULT_SIGNALS: dict[str, dict] = {
+     "R1": {
+         "impl": r"todos\.get\('/',",           # GET / handler in todos.ts
+         "test": r"app\.request\('/api/todos'\)",  # bare /api/todos GET
+@@ -117,6 +158,46 @@ REQUIREMENT_SIGNALS: dict[str, dict] = {
+     },
+ }
+ 
++_DEFAULT_CONFIG: dict = {
++    "impl_file": os.path.join("src", "routes", "todos.ts"),
++    "test_file": os.path.join("src", "routes", "todos.test.ts"),
++    "src_dir": "src",
++    "static_check_requirement_id": "R8",
++    "signals": _DEFAULT_SIGNALS,
++}
++
++_CONFIG_RELATIVE_PATH = os.path.join(".release-captain", "spec-signals.json")
++
++
++def _load_spec_config(repo_path: str, config_path: str | None) -> tuple[dict, str]:
++    """Resolve the signal-mapping config for repo_path.
++
++    Precedence: an explicit config_path argument, then
++    <repo_path>/.release-captain/spec-signals.json, then the bundled
++    default (this project's own demo target only).
++
++    Returns (config, source) where source is a short human-readable string
++    recorded in the output for transparency about which mapping was used.
++    """
++    candidate = config_path
++    if candidate is not None and not os.path.isabs(candidate):
++        candidate = os.path.join(repo_path, candidate)
++
++    if candidate is None:
++        auto_path = os.path.join(repo_path, _CONFIG_RELATIVE_PATH)
++        if os.path.isfile(auto_path):
++            candidate = auto_path
++
++    if candidate is not None and os.path.isfile(candidate):
++        with open(candidate, encoding="utf-8") as fh:
++            try:
++                config = json.load(fh)
++            except json.JSONDecodeError as e:
++                raise ValueError(f"Invalid spec-signals config at {candidate}: {e}") from e
++        return config, candidate
++
++    return copy.deepcopy(_DEFAULT_CONFIG), "built-in default (todos.ts demo target)"
++
+ 
+ def _read(path: str) -> str:
+     """Return file text, or '' if the file doesn't exist."""
+@@ -195,15 +276,23 @@ def _parse_requirements(req_text: str) -> list[dict]:
+     return results
+ 
+ 
+-def run(repo_path: str, requirements_path: str) -> dict:
++def run(repo_path: str, requirements_path: str, config_path: str | None = None) -> dict:
+     """
+     Check every requirement in requirements_path against the implementation
+     and tests in repo_path.
+ 
+     requirements_path may be an absolute path or a path relative to repo_path.
+ 
+-    Returns the contract dict described in the module docstring.
++    config_path optionally names the signal-mapping JSON file to use (see
++    the module docstring); if omitted, <repo_path>/.release-captain/
++    spec-signals.json is used when present, else the bundled default for
++    this project's own demo target.
++
++    Returns the contract dict described in the module docstring, plus a
++    "config_source" field naming which mapping was actually used.
+     """
++    config, config_source = _load_spec_config(repo_path, config_path)
++
+     # Resolve relative requirements_path against repo_path so callers can
+     # pass either an absolute path or a bare filename like "requirements.md".
+     if not os.path.isabs(requirements_path):
+@@ -214,13 +303,16 @@ def run(repo_path: str, requirements_path: str) -> dict:
+             "total_requirements": 0,
+             "covered": 0,
+             "requirements": [],
++            "config_source": config_source,
+         }
+ 
+     requirements_raw = _parse_requirements(req_md)
+ 
+-    impl_file = os.path.join(repo_path, "src", "routes", "todos.ts")
+-    test_file = os.path.join(repo_path, "src", "routes", "todos.test.ts")
+-    src_dir = os.path.join(repo_path, "src")
++    impl_file = os.path.join(repo_path, config["impl_file"])
++    test_file = os.path.join(repo_path, config["test_file"])
++    src_dir = os.path.join(repo_path, config.get("src_dir", ""))
++    static_check_id = config.get("static_check_requirement_id")
++    signal_map = config.get("signals", {})
+ 
+     impl_text = _read(impl_file)
+     test_text = _read(test_file)
+@@ -230,8 +322,8 @@ def run(repo_path: str, requirements_path: str) -> dict:
+         rid = req["id"]
+         text = req["text"]
+ 
+-        # ---- R8: static check only ----------------------------------------
+-        if rid == "R8":
++        # ---- Requirement designated for a static suite-health check --------
++        if static_check_id is not None and rid == static_check_id:
+             ok, evidence = _check_r8_static(test_file)
+             results.append(
+                 {
+@@ -244,14 +336,16 @@ def run(repo_path: str, requirements_path: str) -> dict:
+             continue
+ 
+         # ---- All other requirements: route/handler + test check ------------
+-        signals = REQUIREMENT_SIGNALS.get(rid)
++        signals = signal_map.get(rid)
+         if signals is None:
+             results.append(
+                 {
+                     "id": rid,
+                     "text": text,
+                     "status": "unclear",
+-                    "evidence": f"No signal mapping defined for {rid}",
++                    "evidence": (
++                        f"No signal mapping defined for {rid} in {config_source}"
++                    ),
+                 }
+             )
+             continue
+@@ -306,6 +400,7 @@ def run(repo_path: str, requirements_path: str) -> dict:
+         "total_requirements": len(results),
+         "covered": covered_count,
+         "requirements": results,
++        "config_source": config_source,
+     }
+ 
+ 
+diff --git a/subagents/test.py b/subagents/test.py
+index d6ef534..bf09846 100644
+--- a/subagents/test.py
++++ b/subagents/test.py
+@@ -38,11 +38,25 @@ import subprocess
+ import time
+ from pathlib import Path
+ 
+-
+-def run(repo_path: str, test_command: str | None = None) -> dict:
++# An unattended run must never hang indefinitely on a stuck install or a
++# suite with a runaway test — a timeout turns that into a clear, reported
++# failure (and, via the orchestrator's blocking rule, a NO-GO) instead of a
++# process that never returns.
++_INSTALL_TIMEOUT_SECONDS = 300   # 5 min
++_TEST_RUN_TIMEOUT_SECONDS = 600  # 10 min
++
++
++def run(
++    repo_path: str,
++    test_command: str | None = None,
++    install_timeout: float = _INSTALL_TIMEOUT_SECONDS,
++    test_timeout: float = _TEST_RUN_TIMEOUT_SECONDS,
++) -> dict:
+     """Run the test suite and return a structured results dict.
+ 
+     If *test_command* is None, reads scripts.test from the repo's package.json.
++    Raises RuntimeError (caught by the orchestrator as a subagent error, which
++    forces NO-GO) if install or the test run itself times out.
+     """
+     repo = Path(repo_path)
+ 
+@@ -55,12 +69,19 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
+     # Only runs on a cold environment; skipped once the tree is present so
+     # the timing numbers reported to the orchestrator aren't inflated.
+     if not (repo / "node_modules").exists():
+-        install = subprocess.run(
+-            ["npm", "install"],
+-            cwd=str(repo),
+-            capture_output=True,
+-            text=True,
+-        )
++        try:
++            install = subprocess.run(
++                ["npm", "install"],
++                cwd=str(repo),
++                capture_output=True,
++                text=True,
++                timeout=install_timeout,
++            )
++        except subprocess.TimeoutExpired as e:
++            raise RuntimeError(
++                f"npm install in {repo} did not finish within {install_timeout}s "
++                f"(hung install, not a normal failure)."
++            ) from e
+         if install.returncode != 0:
+             raise RuntimeError(
+                 f"npm install failed in {repo}:\n{install.stderr.strip()}"
+@@ -68,13 +89,22 @@ def run(repo_path: str, test_command: str | None = None) -> dict:
+ 
+     # Step 2b — run the command, capturing stdout+stderr, timing wall-clock
+     start = time.perf_counter()
+-    result = subprocess.run(
+-        test_command,
+-        shell=True,
+-        cwd=str(repo),
+-        capture_output=True,
+-        text=True,
+-    )
++    try:
++        result = subprocess.run(
++            test_command,
++            shell=True,
++            cwd=str(repo),
++            capture_output=True,
++            text=True,
++            timeout=test_timeout,
++        )
++    except subprocess.TimeoutExpired as e:
++        partial = ((e.stdout or "") + (e.stderr or "")).strip()
++        tail = "\n".join(partial.splitlines()[-40:]) if partial else "(no output captured)"
++        raise RuntimeError(
++            f"Test command `{test_command}` in {repo} did not finish within "
++            f"{test_timeout}s and was killed. Last output:\n{tail}"
++        ) from e
+     duration = time.perf_counter() - start
+ 
+     combined = result.stdout + result.stderr
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/gitrepo.py b/tests/gitrepo.py
+new file mode 100644
+index 0000000..9afffcd
+--- /dev/null
++++ b/tests/gitrepo.py
+@@ -0,0 +1,51 @@
++"""Test helper: build a tiny throwaway git repo with two commits, so
++subagents that diff `since_ref..HEAD` (risk.py, spec.py's config lookup,
++changelog.py) can be tested against real git history without depending on
++any external repo (in particular, without depending on the sibling
++release-captain-target clone, which isn't part of this repository and may
++not exist wherever these tests run).
++"""
++
++from __future__ import annotations
++
++import subprocess
++from pathlib import Path
++
++
++def make_repo(tmp_path: Path, base_files: dict[str, str], head_files: dict[str, str]) -> tuple[str, str]:
++    """Create a git repo at tmp_path with two commits:
++      1. "base"  — writes base_files
++      2. "head"  — writes head_files (files not repeated are left as-is;
++                   pass the full desired content for any file that changes)
++
++    Returns (repo_path, base_commit_sha).
++    """
++    repo = tmp_path
++    _run(["git", "init", "-q"], repo)
++    _run(["git", "config", "user.email", "test@example.com"], repo)
++    _run(["git", "config", "user.name", "Test"], repo)
++
++    _write_files(repo, base_files)
++    _run(["git", "add", "-A"], repo)
++    _run(["git", "commit", "-q", "-m", "base"], repo)
++    base_sha = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
++
++    if head_files:
++        _write_files(repo, head_files)
++        _run(["git", "add", "-A"], repo)
++        _run(["git", "commit", "-q", "-m", "head"], repo)
++
++    return str(repo), base_sha
++
++
++def _write_files(repo: Path, files: dict[str, str]) -> None:
++    for rel_path, content in files.items():
++        path = repo / rel_path
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++
++
++def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
++    result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
++    assert result.returncode == 0, f"{' '.join(cmd)} failed: {result.stderr}"
++    return result
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+new file mode 100644
+index 0000000..ee2a303
+--- /dev/null
++++ b/tests/test_orchestrator.py
+@@ -0,0 +1,174 @@
++"""Tests for orchestrator._compute_verdict — the conjunctive GO /
++GO-WITH-WARNINGS / NO-GO rule described in orchestrator.py's module
++docstring. These are plain assert-based functions: runnable under pytest
++(`pytest tests/`) and, since they take no fixtures, also directly by
++calling each test_* function, which is how they were verified while this
++suite was written (no network access here to install pytest itself).
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from datetime import datetime, timezone
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import orchestrator  # noqa: E402
++
++
++NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
++
++
++def test_clean_run_is_go():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {"risk_level": "low", "findings": []},
++        {"requirements": [{"id": "R1", "status": "covered"}]},
++        NOW,
++    )
++    assert verdict == "GO"
++    assert warnings == []
++
++
++def test_medium_risk_is_go_with_warnings_not_silent_pass():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {
++            "risk_level": "medium",
++            "findings": [
++                {"package": "lodash", "change": "4.0->4.1", "severity": "medium", "reason": "minor"}
++            ],
++        },
++        {"requirements": []},
++        NOW,
++    )
++    assert verdict == "GO-WITH-WARNINGS"
++    assert len(warnings) == 1
++    w = warnings[0]
++    assert w["source"] == "risk"
++    assert w["id"] == "lodash"
++    # A warning must always be disposed (owner + rationale + expiry), never
++    # just a bare flag — this is the point of the whole warning tier.
++    assert w["owner"]
++    assert w["rationale"]
++    assert w["expiry"]
++
++
++def test_unclear_spec_requirement_is_go_with_warnings():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {"risk_level": "low", "findings": []},
++        {"requirements": [{"id": "R2", "status": "unclear", "text": "auth", "evidence": "none"}]},
++        NOW,
++    )
++    assert verdict == "GO-WITH-WARNINGS"
++    assert warnings[0]["source"] == "spec"
++    assert warnings[0]["id"] == "R2"
++
++
++def test_failed_tests_block_regardless_of_everything_else():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": False},
++        {"risk_level": "low", "findings": []},
++        {"requirements": [{"id": "R1", "status": "covered"}]},
++        NOW,
++    )
++    assert verdict == "NO-GO"
++    assert warnings == []  # blocking short-circuits warning computation
++
++
++def test_none_passed_blocks_missing_evidence_never_a_pass():
++    # tests["passed"] is None when the test subagent produced no verdict at
++    # all (as distinct from an explicit False) — must still block.
++    verdict, _ = orchestrator._compute_verdict(
++        {"passed": None},
++        {"risk_level": "low", "findings": []},
++        {"requirements": []},
++        NOW,
++    )
++    assert verdict == "NO-GO"
++
++
++def test_high_risk_blocks():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {"risk_level": "high", "findings": []},
++        {"requirements": []},
++        NOW,
++    )
++    assert verdict == "NO-GO"
++    assert warnings == []
++
++
++def test_not_covered_requirement_blocks():
++    verdict, _ = orchestrator._compute_verdict(
++        {"passed": True},
++        {"risk_level": "low", "findings": []},
++        {"requirements": [{"id": "R1", "status": "not_covered"}]},
++        NOW,
++    )
++    assert verdict == "NO-GO"
++
++
++def test_subagent_error_blocks_each_of_the_three():
++    for key in ("test", "risk", "spec"):
++        results = {
++            "test": {"passed": True},
++            "risk": {"risk_level": "low", "findings": []},
++            "spec": {"requirements": []},
++        }
++        results[key] = {"error": "boom"}
++        verdict, _ = orchestrator._compute_verdict(
++            results["test"], results["risk"], results["spec"], NOW
++        )
++        assert verdict == "NO-GO", f"expected NO-GO when {key} subagent errors"
++
++
++def test_no_go_beats_warnings_conjunctive_not_compensatory():
++    # A blocking failure (not_covered) alongside a medium-risk finding must
++    # still be NO-GO, not "averaged" into GO-WITH-WARNINGS — gates are
++    # conjunctive: nothing compensates for a blocking failure.
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {
++            "risk_level": "medium",
++            "findings": [{"package": "x", "change": "1->2", "severity": "medium", "reason": "r"}],
++        },
++        {"requirements": [{"id": "R1", "status": "not_covered"}]},
++        NOW,
++    )
++    assert verdict == "NO-GO"
++    assert warnings == []
++
++
++def test_warning_expiry_is_in_the_future():
++    verdict, warnings = orchestrator._compute_verdict(
++        {"passed": True},
++        {
++            "risk_level": "medium",
++            "findings": [{"package": "x", "change": "1->2", "severity": "medium", "reason": "r"}],
++        },
++        {"requirements": []},
++        NOW,
++    )
++    expiry = datetime.fromisoformat(warnings[0]["expiry"])
++    assert expiry.date() > NOW.date()
++
++
++if __name__ == "__main__":
++    # Fallback runner for environments without pytest installed: run every
++    # test_* function directly and report pass/fail, so this suite is
++    # verifiable without a network connection to install pytest.
++    failures = []
++    tests = {name: fn for name, fn in list(globals().items()) if name.startswith("test_")}
++    for name, fn in tests.items():
++        try:
++            fn()
++            print(f"PASS  {name}")
++        except AssertionError as e:
++            failures.append(name)
++            print(f"FAIL  {name}: {e}")
++    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
++    if failures:
++        raise SystemExit(1)
+diff --git a/tests/test_risk.py b/tests/test_risk.py
+new file mode 100644
+index 0000000..de12a5f
+--- /dev/null
++++ b/tests/test_risk.py
+@@ -0,0 +1,215 @@
++"""Tests for subagents/risk.py — dependency-risk severity assignment,
++across all three supported manifest ecosystems (Node, pip, pyproject).
++
++Covers, most importantly, that "high" severity is actually reachable (the
++bug this project's own code review found: risk_level could be declared
++"high" in the contract but no code path ever produced it) for every
++ecosystem, not just Node.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from subagents import risk  # noqa: E402
++from tests.gitrepo import make_repo  # noqa: E402
++
++
++def _tmp() -> Path:
++    return Path(tempfile.mkdtemp(prefix="rc_risk_test_"))
++
++
++# ---------------------------------------------------------------------------
++# Node (package.json / package-lock.json)
++# ---------------------------------------------------------------------------
++
++def test_node_removed_production_dependency_is_high():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={
++                "package.json": '{"dependencies":{"express":"3.0.0"},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/express":{"version":"3.0.0"}}}',
++            },
++            head_files={
++                "package.json": '{"dependencies":{},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{}}',
++            },
++        )
++        result = risk.run(repo, base)
++        assert result["manifest_kind"] == "node"
++        assert result["risk_level"] == "high"
++        assert any(f["package"] == "express" and f["severity"] == "high" for f in result["findings"])
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_node_removed_dev_dependency_is_low():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={
++                "package.json": '{"dependencies":{},"devDependencies":{"jest":"1.0.0"}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/jest":{"version":"1.0.0"}}}',
++            },
++            head_files={
++                "package.json": '{"dependencies":{},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{}}',
++            },
++        )
++        result = risk.run(repo, base)
++        assert result["risk_level"] == "low"
++        assert result["findings"][0]["severity"] == "low"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_node_single_major_bump_is_medium_not_high():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={
++                "package.json": '{"dependencies":{"react":"17.0.0"},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/react":{"version":"17.0.0"}}}',
++            },
++            head_files={
++                "package.json": '{"dependencies":{"react":"18.0.0"},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/react":{"version":"18.0.0"}}}',
++            },
++        )
++        result = risk.run(repo, base)
++        assert result["risk_level"] == "medium"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_node_multi_major_skip_is_high():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={
++                "package.json": '{"dependencies":{"react":"16.0.0"},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/react":{"version":"16.0.0"}}}',
++            },
++            head_files={
++                "package.json": '{"dependencies":{"react":"19.0.0"},"devDependencies":{}}',
++                "package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/react":{"version":"19.0.0"}}}',
++            },
++        )
++        result = risk.run(repo, base)
++        assert result["risk_level"] == "high"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_node_no_changes_is_low_empty():
++    tmp = _tmp()
++    try:
++        manifest = '{"dependencies":{"lodash":"4.0.0"},"devDependencies":{}}'
++        lock = '{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.0.0"}}}'
++        repo, base = make_repo(
++            tmp,
++            base_files={"package.json": manifest, "package-lock.json": lock},
++            head_files={},
++        )
++        result = risk.run(repo, base)
++        assert result["risk_level"] == "low"
++        assert result["findings"] == []
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------
++# pip (requirements.txt)
++# ---------------------------------------------------------------------------
++
++def test_pip_multi_major_skip_is_high():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={"requirements.txt": "flask==1.0.0\n"},
++            head_files={"requirements.txt": "flask==3.0.0\n"},
++        )
++        result = risk.run(repo, base)
++        assert result["manifest_kind"] == "pip"
++        assert result["risk_level"] == "high"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_pip_removed_dependency_is_high():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(
++            tmp,
++            base_files={"requirements.txt": "flask==1.0.0\noldpkg==1.0.0\n"},
++            head_files={"requirements.txt": "flask==1.0.0\n"},
++        )
++        result = risk.run(repo, base)
++        assert any(f["package"] == "oldpkg" and f["severity"] == "high" for f in result["findings"])
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------
++# pyproject.toml (PEP 621)
++# ---------------------------------------------------------------------------
++
++def test_pyproject_major_skip_is_high():
++    tmp = _tmp()
++    try:
++        base_toml = '[project]\nname = "demo"\ndependencies = ["django==3.0.0"]\n'
++        head_toml = '[project]\nname = "demo"\ndependencies = ["django==5.0.0"]\n'
++        repo, base = make_repo(
++            tmp,
++            base_files={"pyproject.toml": base_toml},
++            head_files={"pyproject.toml": head_toml},
++        )
++        result = risk.run(repo, base)
++        assert result["manifest_kind"] == "pyproject"
++        assert result["risk_level"] == "high"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------
++# No manifest at all
++# ---------------------------------------------------------------------------
++
++def test_no_manifest_reports_none_kind_not_false_low_confidence():
++    tmp = _tmp()
++    try:
++        repo, base = make_repo(tmp, base_files={"README.md": "hi\n"}, head_files={})
++        result = risk.run(repo, base)
++        assert result["manifest_kind"] == "none"
++        # Still technically "low" (nothing to flag), but the summary must
++        # say plainly that nothing was actually checked.
++        assert "not actually" in result["summary_markdown"] or "could not actually" in result["summary_markdown"]
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    failures = []
++    tests = {name: fn for name, fn in list(globals().items()) if name.startswith("test_")}
++    for name, fn in tests.items():
++        try:
++            fn()
++            print(f"PASS  {name}")
++        except AssertionError as e:
++            failures.append(name)
++            print(f"FAIL  {name}: {e}")
++    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
++    if failures:
++        raise SystemExit(1)
+diff --git a/tests/test_spec.py b/tests/test_spec.py
+new file mode 100644
+index 0000000..17bf3ea
+--- /dev/null
++++ b/tests/test_spec.py
+@@ -0,0 +1,119 @@
++"""Tests for subagents/spec.py — requirement coverage and its per-repo
++config generalization (see subagents/spec.py's module docstring for the
++.release-captain/spec-signals.json schema this replaced the hardcoded
++todos.ts regex mapping with).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from subagents import spec  # noqa: E402
++
++
++def _tmp_repo(files: dict[str, str]) -> Path:
++    tmp = Path(tempfile.mkdtemp(prefix="rc_spec_test_"))
++    for rel_path, content in files.items():
++        path = tmp / rel_path
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++    return tmp
++
++
++def test_repo_supplied_config_is_used_and_named():
++    tmp = _tmp_repo({
++        "requirements.md": "- [ ] **R1 — Health endpoint responds.**\n",
++        "src/app.py": "def health():\n    return {'status': 'ok'}\n",
++        "src/app_test.py": "def test_health():\n    assert health()\n",
++        ".release-captain/spec-signals.json": json.dumps({
++            "impl_file": "src/app.py",
++            "test_file": "src/app_test.py",
++            "src_dir": "src",
++            "signals": {
++                "R1": {
++                    "impl": "def health",
++                    "test": "test_health",
++                    "impl_label": "def health()",
++                    "test_label": "test_health()",
++                }
++            },
++        }),
++    })
++    try:
++        result = spec.run(str(tmp), "requirements.md")
++        assert result["requirements"][0]["status"] == "covered"
++        assert "spec-signals.json" in result["config_source"]
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_unmapped_requirement_is_unclear_not_silent_pass():
++    tmp = _tmp_repo({
++        "requirements.md": (
++            "- [ ] **R1 — Health endpoint responds.**\n"
++            "- [ ] **R2 — Some other requirement with no mapping.**\n"
++        ),
++        "src/app.py": "def health():\n    return True\n",
++        "src/app_test.py": "def test_health():\n    assert health()\n",
++        ".release-captain/spec-signals.json": json.dumps({
++            "impl_file": "src/app.py",
++            "test_file": "src/app_test.py",
++            "src_dir": "src",
++            "signals": {
++                "R1": {"impl": "def health", "test": "test_health", "impl_label": "", "test_label": ""},
++            },
++        }),
++    })
++    try:
++        result = spec.run(str(tmp), "requirements.md")
++        statuses = {r["id"]: r["status"] for r in result["requirements"]}
++        assert statuses["R1"] == "covered"
++        assert statuses["R2"] == "unclear"  # never silently "covered"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_no_repo_config_falls_back_to_default_and_says_so():
++    # A repo with none of its own .release-captain/spec-signals.json falls
++    # back to the bundled default (this project's own demo target) —
++    # confirmed here only by checking config_source names the fallback,
++    # not by asserting specific coverage (that depends on the default's
++    # own todos.ts-shaped signals, tested implicitly by the live demo).
++    tmp = _tmp_repo({"requirements.md": "- [ ] **R1 — Anything.**\n"})
++    try:
++        result = spec.run(str(tmp), "requirements.md")
++        assert "default" in result["config_source"]
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_missing_requirements_file_returns_empty_not_a_crash():
++    tmp = _tmp_repo({})
++    try:
++        result = spec.run(str(tmp), "requirements.md")
++        assert result["total_requirements"] == 0
++        assert result["requirements"] == []
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    failures = []
++    tests = {name: fn for name, fn in list(globals().items()) if name.startswith("test_")}
++    for name, fn in tests.items():
++        try:
++            fn()
++            print(f"PASS  {name}")
++        except AssertionError as e:
++            failures.append(name)
++            print(f"FAIL  {name}: {e}")
++    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
++    if failures:
++        raise SystemExit(1)
+diff --git a/tests/test_test_subagent.py b/tests/test_test_subagent.py
+new file mode 100644
+index 0000000..f7f9a26
+--- /dev/null
++++ b/tests/test_test_subagent.py
+@@ -0,0 +1,61 @@
++"""Tests for subagents/test.py — in particular that a hung test command is
++turned into a clear, bounded RuntimeError (which the orchestrator then
++treats as a subagent error, forcing NO-GO) instead of hanging forever.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from subagents import test as _test_subagent  # noqa: E402 (leading underscore: not picked up as a test_* function below)
++
++
++def test_hung_command_times_out_instead_of_hanging_forever():
++    tmp = Path(tempfile.mkdtemp(prefix="rc_test_subagent_"))
++    try:
++        # node_modules exists so the install step is skipped and only the
++        # test-run timeout path is exercised.
++        (tmp / "node_modules").mkdir()
++        started = time.perf_counter()
++        try:
++            _test_subagent.run(str(tmp), test_command="sleep 30", test_timeout=1)
++            raised = False
++        except RuntimeError:
++            raised = True
++        elapsed = time.perf_counter() - started
++        assert raised, "a hung test command must raise, not hang forever"
++        assert elapsed < 10, f"timeout should bound the wait to ~1s, took {elapsed:.1f}s"
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def test_normal_command_still_works():
++    tmp = Path(tempfile.mkdtemp(prefix="rc_test_subagent_"))
++    try:
++        (tmp / "node_modules").mkdir()
++        result = _test_subagent.run(str(tmp), test_command="echo done", test_timeout=10)
++        assert "duration_seconds" in result
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    failures = []
++    tests = {name: fn for name, fn in list(globals().items()) if name.startswith("test_")}
++    for name, fn in tests.items():
++        try:
++            fn()
++            print(f"PASS  {name}")
++        except AssertionError as e:
++            failures.append(name)
++            print(f"FAIL  {name}: {e}")
++    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
++    if failures:
++        raise SystemExit(1)

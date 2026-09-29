@@ -250,12 +250,36 @@ def _render_verdict(report: dict) -> None:
     with col_v:
         if verdict == "GO":
             st.success("## ✅ GO — ready to ship", icon=None)
+        elif verdict == "GO-WITH-WARNINGS":
+            st.warning("## ⚠️ GO — WITH WARNINGS", icon=None)
         else:
             st.error("## ❌ NO-GO — do not ship", icon=None)
     with col_d:
         st.metric("Run duration", f"{duration}s")
     with col_t:
         st.caption(f"Generated: {generated}")
+
+
+def _render_warnings(warnings: list[dict]) -> None:
+    if not warnings:
+        return
+    st.subheader("⚠️ Warnings (tracked, non-blocking)")
+    st.caption(
+        "These didn't block the release, but they're recorded with an "
+        "owner and a review date rather than silently passing."
+    )
+    rows = [
+        {
+            "Source": w["source"],
+            "Finding": w["id"],
+            "Description": w["description"],
+            "Owner": w["owner"],
+            "Review by": w["expiry"],
+            "Rationale": w["rationale"],
+        }
+        for w in warnings
+    ]
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _render_changelog(data: dict) -> None:
@@ -360,6 +384,24 @@ def _render_rollback(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Environment bootstrap — cached so it runs once per server process, not on
+# every rerun (every widget interaction re-executes this whole script; the
+# Node-version check and repo-existence check are cheap individually, but
+# there's no reason to redo them dozens of times per session, and this is
+# also the natural place a future, more expensive bootstrap step would need
+# this guard). st.cache_resource shares its result across all sessions on
+# this server process, matching the sentinel-file idempotency _ensure_node
+# already relies on.
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _bootstrap_environment() -> bool:
+    _ensure_node()
+    _ensure_repo()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
 
@@ -367,11 +409,8 @@ st.set_page_config(page_title="Release Captain", page_icon="🚢", layout="wide"
 
 st.title("🚢 Release Captain")
 
-# ── Ensure Node.js 22 is available (installs on Streamlit Cloud if missing) ──
-_ensure_node()
-
-# ── Ensure the target repo exists (clone on first run) ────────────────────
-_ensure_repo()
+# ── Ensure Node.js 22 and the target repo are ready (cached — see above) ──
+_bootstrap_environment()
 
 # ── Branch selector ───────────────────────────────────────────────────────
 st.markdown("**Select a scenario to check:**")
@@ -402,6 +441,7 @@ report = st.session_state["report"]
 
 # ── Verdict banner ────────────────────────────────────────────────────────
 _render_verdict(report)
+_render_warnings(report.get("warnings", []))
 
 st.divider()
 

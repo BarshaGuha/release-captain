@@ -30,17 +30,58 @@ Notes for Bob:
   test that exercises it — "covered" means both exist, not just one.
 - Requirements explicitly marked out of scope in the doc are not counted
   against coverage.
+
+PER-REPO CONFIGURATION
+-----------------------
+The requirement→code/test signal mapping is repo-specific by nature (it has
+to name real files, function names, and patterns), so it is no longer
+hardcoded to this project's original demo target. It is now read from a
+config file:
+
+    <repo_path>/.release-captain/spec-signals.json
+
+with this shape:
+
+    {
+        "impl_file": "src/routes/todos.ts",   # relative to repo_path
+        "test_file": "src/routes/todos.test.ts",
+        "src_dir": "src",                      # used when a signal sets "impl_glob": true
+        "static_check_requirement_id": "R8",   # optional: this one req gets a
+                                                # suite-health check instead of
+                                                # pattern matching (see _check_r8_static)
+        "signals": {
+            "R1": {
+                "impl": "todos\\.get\\('/',",
+                "test": "app\\.request\\('/api/todos'\\)",
+                "impl_label": "todos.get('/', …) in todos.ts",
+                "test_label": "app.request('/api/todos') in todos.test.ts",
+                "impl_glob": false   # optional; search all files under src_dir instead
+            },
+            ...
+        }
+    }
+
+If no such file exists in the target repo, spec.run() falls back to
+_DEFAULT_CONFIG below — the exact mapping this project shipped with for its
+own demo target (a Hono todos API) — so existing behavior is unchanged for
+that repo. Any other repo without its own config will report every
+requirement as "unclear: no config found for this repo", rather than
+silently reusing signals that describe a different codebase.
 """
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import re
 
 
 # ---------------------------------------------------------------------------
-# Route / signal mapping
+# Default signal mapping — this project's own demo target only
 #
+# Kept as the fallback so a repo that hasn't been given its own
+# .release-captain/spec-signals.json still behaves exactly as before.
 # Each entry maps a requirement ID to a pair of search strings:
 #   (impl_pattern, test_pattern)
 #
@@ -57,7 +98,7 @@ import re
 #
 # Patterns for todos.test.ts use the full paths that app.request() receives.
 
-REQUIREMENT_SIGNALS: dict[str, dict] = {
+_DEFAULT_SIGNALS: dict[str, dict] = {
     "R1": {
         "impl": r"todos\.get\('/',",           # GET / handler in todos.ts
         "test": r"app\.request\('/api/todos'\)",  # bare /api/todos GET
@@ -116,6 +157,46 @@ REQUIREMENT_SIGNALS: dict[str, dict] = {
         "impl_glob": True,   # search all .ts files under src/ instead of only todos.ts
     },
 }
+
+_DEFAULT_CONFIG: dict = {
+    "impl_file": os.path.join("src", "routes", "todos.ts"),
+    "test_file": os.path.join("src", "routes", "todos.test.ts"),
+    "src_dir": "src",
+    "static_check_requirement_id": "R8",
+    "signals": _DEFAULT_SIGNALS,
+}
+
+_CONFIG_RELATIVE_PATH = os.path.join(".release-captain", "spec-signals.json")
+
+
+def _load_spec_config(repo_path: str, config_path: str | None) -> tuple[dict, str]:
+    """Resolve the signal-mapping config for repo_path.
+
+    Precedence: an explicit config_path argument, then
+    <repo_path>/.release-captain/spec-signals.json, then the bundled
+    default (this project's own demo target only).
+
+    Returns (config, source) where source is a short human-readable string
+    recorded in the output for transparency about which mapping was used.
+    """
+    candidate = config_path
+    if candidate is not None and not os.path.isabs(candidate):
+        candidate = os.path.join(repo_path, candidate)
+
+    if candidate is None:
+        auto_path = os.path.join(repo_path, _CONFIG_RELATIVE_PATH)
+        if os.path.isfile(auto_path):
+            candidate = auto_path
+
+    if candidate is not None and os.path.isfile(candidate):
+        with open(candidate, encoding="utf-8") as fh:
+            try:
+                config = json.load(fh)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid spec-signals config at {candidate}: {e}") from e
+        return config, candidate
+
+    return copy.deepcopy(_DEFAULT_CONFIG), "built-in default (todos.ts demo target)"
 
 
 def _read(path: str) -> str:
@@ -195,15 +276,23 @@ def _parse_requirements(req_text: str) -> list[dict]:
     return results
 
 
-def run(repo_path: str, requirements_path: str) -> dict:
+def run(repo_path: str, requirements_path: str, config_path: str | None = None) -> dict:
     """
     Check every requirement in requirements_path against the implementation
     and tests in repo_path.
 
     requirements_path may be an absolute path or a path relative to repo_path.
 
-    Returns the contract dict described in the module docstring.
+    config_path optionally names the signal-mapping JSON file to use (see
+    the module docstring); if omitted, <repo_path>/.release-captain/
+    spec-signals.json is used when present, else the bundled default for
+    this project's own demo target.
+
+    Returns the contract dict described in the module docstring, plus a
+    "config_source" field naming which mapping was actually used.
     """
+    config, config_source = _load_spec_config(repo_path, config_path)
+
     # Resolve relative requirements_path against repo_path so callers can
     # pass either an absolute path or a bare filename like "requirements.md".
     if not os.path.isabs(requirements_path):
@@ -214,13 +303,16 @@ def run(repo_path: str, requirements_path: str) -> dict:
             "total_requirements": 0,
             "covered": 0,
             "requirements": [],
+            "config_source": config_source,
         }
 
     requirements_raw = _parse_requirements(req_md)
 
-    impl_file = os.path.join(repo_path, "src", "routes", "todos.ts")
-    test_file = os.path.join(repo_path, "src", "routes", "todos.test.ts")
-    src_dir = os.path.join(repo_path, "src")
+    impl_file = os.path.join(repo_path, config["impl_file"])
+    test_file = os.path.join(repo_path, config["test_file"])
+    src_dir = os.path.join(repo_path, config.get("src_dir", ""))
+    static_check_id = config.get("static_check_requirement_id")
+    signal_map = config.get("signals", {})
 
     impl_text = _read(impl_file)
     test_text = _read(test_file)
@@ -230,8 +322,8 @@ def run(repo_path: str, requirements_path: str) -> dict:
         rid = req["id"]
         text = req["text"]
 
-        # ---- R8: static check only ----------------------------------------
-        if rid == "R8":
+        # ---- Requirement designated for a static suite-health check --------
+        if static_check_id is not None and rid == static_check_id:
             ok, evidence = _check_r8_static(test_file)
             results.append(
                 {
@@ -244,14 +336,16 @@ def run(repo_path: str, requirements_path: str) -> dict:
             continue
 
         # ---- All other requirements: route/handler + test check ------------
-        signals = REQUIREMENT_SIGNALS.get(rid)
+        signals = signal_map.get(rid)
         if signals is None:
             results.append(
                 {
                     "id": rid,
                     "text": text,
                     "status": "unclear",
-                    "evidence": f"No signal mapping defined for {rid}",
+                    "evidence": (
+                        f"No signal mapping defined for {rid} in {config_source}"
+                    ),
                 }
             )
             continue
@@ -306,6 +400,7 @@ def run(repo_path: str, requirements_path: str) -> dict:
         "total_requirements": len(results),
         "covered": covered_count,
         "requirements": results,
+        "config_source": config_source,
     }
 
 

@@ -28,6 +28,12 @@ from __future__ import annotations
 
 import subprocess
 
+# `git log` against a local repo is normally instant; this guards only
+# against a genuinely hung process (e.g. a corrupted repo or a network
+# filesystem stall) so a single subagent can't block an unattended run
+# forever.
+_GIT_LOG_TIMEOUT_SECONDS = 30
+
 
 _FEAT_KEYWORDS = {"add", "added", "adds", "implement", "implements", "implemented",
                   "introduce", "introduces", "introduced", "new", "create", "creates",
@@ -91,13 +97,20 @@ def run(repo_path: str, since_ref: str) -> dict:
         commit_count : int
         commits : list[dict]  — each has keys: hash, summary, kind
     """
-    result = subprocess.run(
-        ["git", "log", f"{since_ref}..HEAD", "--oneline"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "log", f"{since_ref}..HEAD", "--oneline"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=_GIT_LOG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"`git log {since_ref}..HEAD` in {repo_path} did not finish within "
+            f"{_GIT_LOG_TIMEOUT_SECONDS}s."
+        ) from e
 
     commits = []
     for line in result.stdout.strip().splitlines():

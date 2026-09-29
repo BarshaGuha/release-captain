@@ -35,3 +35,8 @@ node_modules/
 dist/
 .vscode/
 .idea/
+
+# ---- Local run-history audit trail (orchestrator.py's history_dir) ----
+# Per-run output, not source; on Streamlit Community Cloud this directory
+# doesn't survive a redeploy anyway (see orchestrator.py's module docstring).
+run_history/
