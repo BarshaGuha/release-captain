@@ -50,6 +50,7 @@ TEST_COMMAND      = os.environ.get("RC_TEST_COMMAND",  None)   # None → read f
 BRANCH_OPTIONS = {
     "release/v1.2.0 (GO scenario)":           "release/v1.2.0",
     "release/v1.2.0-regression (NO-GO scenario)": "release/v1.2.0-regression",
+    "release/v1.3.0-dependency-risk (HIGH RISK scenario)": "release/v1.3.0-dependency-risk",
 }
 DEFAULT_BRANCH_LABEL = "release/v1.2.0 (GO scenario)"
 
