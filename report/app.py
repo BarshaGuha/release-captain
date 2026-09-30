@@ -16,12 +16,14 @@ Expected shape:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tarfile
 import tempfile
 import urllib.request
+from pathlib import Path
 
 # Ensure the repo root is on sys.path so `import orchestrator` and
 # `from subagents import ...` resolve correctly when Streamlit runs
@@ -385,6 +387,87 @@ def _render_rollback(text: str) -> None:
     st.markdown(text)
 
 
+def _render_history() -> None:
+    """Read run_history/index.jsonl and render a newest-first history table."""
+    history_dir = orchestrator._DEFAULT_HISTORY_DIR
+    index_path = history_dir / "index.jsonl"
+
+    if not index_path.exists():
+        st.info(
+            "📭 No run history yet — history is recorded here automatically "
+            "each time you run a release check. Come back after your first run."
+        )
+        return
+
+    # Parse all lines, skip blank/corrupt entries silently
+    rows = []
+    raw_lines = index_path.read_text(encoding="utf-8").splitlines()
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rows.append(entry)
+
+    if not rows:
+        st.info("📭 History file exists but contains no valid entries yet.")
+        return
+
+    # Newest first
+    rows.sort(key=lambda r: r.get("generated_at", ""), reverse=True)
+
+    _VERDICT_ICON = {
+        "GO":               "🟢",
+        "GO-WITH-WARNINGS": "🟡",
+        "NO-GO":            "🔴",
+    }
+
+    table_rows = []
+    for r in rows:
+        verdict = r.get("verdict", "UNKNOWN")
+        icon = _VERDICT_ICON.get(verdict, "⚪")
+        commit = r.get("repo_commit", "unknown")
+        short_sha = commit[:7] if commit != "unknown" else "unknown"
+        duration = r.get("duration_seconds")
+        duration_str = f"{duration}s" if duration is not None else "—"
+        warning_count = r.get("warning_count", 0)
+        table_rows.append({
+            "Timestamp":  r.get("generated_at", ""),
+            "Verdict":    f"{icon} {verdict}",
+            "Commit":     short_sha,
+            "Duration":   duration_str,
+            "Warnings":   warning_count,
+            "Run ID":     r.get("run_id", ""),
+        })
+
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+    # Expander: let the user browse the full JSON of any individual run
+    with st.expander("🔍 Browse a full run record"):
+        run_ids = [r.get("run_id", "") for r in rows if r.get("run_id")]
+        if not run_ids:
+            st.caption("No run IDs available.")
+        else:
+            selected_id = st.selectbox(
+                "Select run ID",
+                options=run_ids,
+                format_func=lambda rid: rid[:12] + "…",
+                label_visibility="collapsed",
+            )
+            record_path = history_dir / f"{selected_id}.json"
+            if record_path.exists():
+                full_record = json.loads(record_path.read_text(encoding="utf-8"))
+                st.json(full_record, expanded=False)
+            else:
+                st.warning(
+                    f"Full record `{selected_id}.json` not found — "
+                    "it may have been deleted or the app was redeployed."
+                )
+
+
 # ---------------------------------------------------------------------------
 # Environment bootstrap — cached so it runs once per server process, not on
 # every rerun (every widget interaction re-executes this whole script; the
@@ -448,8 +531,8 @@ _render_warnings(report.get("warnings", []))
 st.divider()
 
 # ── Four subagent sections ────────────────────────────────────────────────
-tab_cl, tab_risk, tab_tests, tab_spec = st.tabs(
-    ["📋 Changelog", "⚠️ Risk", "🧪 Tests", "📐 Spec Coverage"]
+tab_cl, tab_risk, tab_tests, tab_spec, tab_hist = st.tabs(
+    ["📋 Changelog", "⚠️ Risk", "🧪 Tests", "📐 Spec Coverage", "📜 History"]
 )
 
 with tab_cl:
@@ -467,6 +550,10 @@ with tab_tests:
 with tab_spec:
     st.subheader("Requirement Coverage")
     _render_spec(report.get("spec", {}))
+
+with tab_hist:
+    st.subheader("Run History")
+    _render_history()
 
 st.divider()
 

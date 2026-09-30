@@ -125,6 +125,7 @@ def _write_run_record(report: dict, history_dir: Path) -> None:
             "repo_commit": report["repo_commit"],
             "verdict": report["verdict"],
             "warning_count": len(report.get("warnings", [])),
+            "duration_seconds": report.get("duration_seconds"),
         }
         with open(history_dir / "index.jsonl", "a") as f:
             f.write(json.dumps(index_line) + "\n")
