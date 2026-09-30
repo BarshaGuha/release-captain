@@ -119,13 +119,34 @@ def _write_run_record(report: dict, history_dir: Path) -> None:
         with open(record_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
 
+        # Derive compact summaries from subagent results for the index line
+        # so the History tab can display meaningful info without opening each
+        # full record file.
+        _tests = report.get("tests", {})
+        _risk  = report.get("risk", {})
+        _spec  = report.get("spec", {})
+        passed  = _tests.get("passed")
+        total   = _tests.get("total", 0)
+        failed  = _tests.get("failed", 0)
+        test_summary = (
+            f"{total} tests — {failed} failed"
+            if not passed
+            else f"{total} tests passed"
+        )
+
         index_line = {
-            "run_id": report["run_id"],
-            "generated_at": report["generated_at"],
-            "repo_commit": report["repo_commit"],
-            "verdict": report["verdict"],
-            "warning_count": len(report.get("warnings", [])),
+            "run_id":          report["run_id"],
+            "generated_at":    report["generated_at"],
+            "repo_commit":     report["repo_commit"],
+            "branch":          report.get("branch", ""),
+            "verdict":         report["verdict"],
+            "warning_count":   len(report.get("warnings", [])),
             "duration_seconds": report.get("duration_seconds"),
+            "risk_level":      _risk.get("risk_level", "unknown"),
+            "test_summary":    test_summary,
+            "spec_summary":    (
+                f"{_spec.get('covered', '?')}/{_spec.get('total_requirements', '?')} requirements"
+            ),
         }
         with open(history_dir / "index.jsonl", "a") as f:
             f.write(json.dumps(index_line) + "\n")
@@ -221,12 +242,16 @@ def run_release_check(
     requirements_path: str,
     test_command: str | None = None,
     history_dir: str | Path | None = None,
+    branch: str | None = None,
 ) -> dict:
     """Run all four subagents concurrently and return the full release report.
 
     Also persists the report to history_dir (default: run_history/ next to
     this file) so it can be looked up later by run_id or commit — see the
     module docstring's note on run_id/repo_commit/history persistence.
+
+    branch, if supplied, is recorded in the index line so the History tab
+    can display which branch was checked without opening the full record.
     """
     repo_path = str(Path(repo_path).resolve())
 
@@ -276,6 +301,7 @@ def run_release_check(
         "verdict": verdict,
         "generated_at": generated_at.isoformat(),
         "repo_commit": _resolve_commit(repo_path),
+        "branch": branch or "",
         "duration_seconds": round(duration, 3),
         "changelog": changelog_result,
         "risk": risk_result,

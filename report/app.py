@@ -205,21 +205,47 @@ def _ensure_repo() -> None:
 
 
 def _checkout_branch(branch: str) -> None:
-    """Check out *branch* in the target repo (fetch first to ensure it's present)."""
-    subprocess.run(
-        ["git", "fetch", "--all"],
-        cwd=REPO_PATH, check=True, capture_output=True, text=True,
-    )
+    """Check out *branch* in the target repo.
+
+    Fetch strategy: only fetch when the remote tracking ref for *branch*
+    is absent locally (first time) or when the local HEAD sha differs from
+    origin's sha (someone pushed new commits). This avoids a ~4 s network
+    round-trip to GitHub on every branch switch when nothing has changed.
+    """
+    def _sha(ref: str) -> str:
+        r = subprocess.run(
+            ["git", "rev-parse", "--verify", ref],
+            cwd=REPO_PATH, capture_output=True, text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    remote_ref = f"refs/remotes/origin/{branch}"
+    local_sha  = _sha(remote_ref)
+
+    needs_fetch = True
+    if local_sha:
+        # Remote ref exists locally — do a lightweight ls-remote instead of
+        # a full fetch to check whether the remote has moved.
+        ls = subprocess.run(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=REPO_PATH, capture_output=True, text=True, timeout=10,
+        )
+        remote_sha = ls.stdout.split()[0] if ls.stdout.strip() else ""
+        needs_fetch = remote_sha and remote_sha != local_sha
+
+    if needs_fetch:
+        subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=REPO_PATH, check=True, capture_output=True, text=True,
+        )
+
     # Discard any modifications to tracked files (e.g. package-lock.json
     # written by npm install in test.py) so they never block the checkout.
-    # HEAD may not exist on a fresh clone with no commits checked out yet,
-    # so fall back to an empty-tree reset in that case.
     subprocess.run(
         ["git", "reset", "--hard", "HEAD"],
         cwd=REPO_PATH, check=False, capture_output=True, text=True,
     )
     # Use -B so the branch is created (or reset) from the remote tracking ref.
-    # This works whether the branch exists locally already or not.
     subprocess.run(
         ["git", "checkout", "-B", branch, f"origin/{branch}"],
         cwd=REPO_PATH, check=True, capture_output=True, text=True,
@@ -238,6 +264,7 @@ def _run(branch: str) -> dict:
         since_ref=SINCE_REF,
         requirements_path=req_path,
         test_command=TEST_COMMAND,
+        branch=branch,
     )
 
 
@@ -387,6 +414,18 @@ def _render_rollback(text: str) -> None:
     st.markdown(text)
 
 
+def _fmt_timestamp(iso: str) -> str:
+    """Convert ISO timestamp to a human-readable local string, e.g. 'Sep 30, 14:23'."""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso)
+        # Convert UTC to local time
+        dt_local = dt.astimezone()
+        return dt_local.strftime("%b %d, %H:%M")
+    except Exception:
+        return iso  # fall back to raw string if parsing fails
+
+
 def _render_history() -> None:
     """Read run_history/index.jsonl and render a newest-first history table."""
     history_dir = orchestrator._DEFAULT_HISTORY_DIR
@@ -420,51 +459,65 @@ def _render_history() -> None:
     rows.sort(key=lambda r: r.get("generated_at", ""), reverse=True)
 
     _VERDICT_ICON = {
-        "GO":               "🟢",
-        "GO-WITH-WARNINGS": "🟡",
-        "NO-GO":            "🔴",
+        "GO":               "🟢 GO",
+        "GO-WITH-WARNINGS": "🟡 GO WITH WARNINGS",
+        "NO-GO":            "🔴 NO-GO",
     }
+    _RISK_ICON = {"low": "🟢", "medium": "🟡", "high": "🔴", "unknown": "⚪"}
 
     table_rows = []
     for r in rows:
-        verdict = r.get("verdict", "UNKNOWN")
-        icon = _VERDICT_ICON.get(verdict, "⚪")
-        commit = r.get("repo_commit", "unknown")
-        short_sha = commit[:7] if commit != "unknown" else "unknown"
-        duration = r.get("duration_seconds")
-        duration_str = f"{duration}s" if duration is not None else "—"
+        verdict     = r.get("verdict", "UNKNOWN")
+        risk_level  = r.get("risk_level", "unknown")
+        duration    = r.get("duration_seconds")
         warning_count = r.get("warning_count", 0)
+
+        # Branch: strip the "release/" prefix for compactness, fall back to commit SHA
+        branch = r.get("branch", "")
+        branch_label = branch.replace("release/", "") if branch else r.get("repo_commit", "unknown")[:7]
+
+        # Warnings column: blank when none so it doesn't clutter the happy path
+        warnings_str = f"⚠️ {warning_count}" if warning_count else "—"
+
         table_rows.append({
-            "Timestamp":  r.get("generated_at", ""),
-            "Verdict":    f"{icon} {verdict}",
-            "Commit":     short_sha,
-            "Duration":   duration_str,
-            "Warnings":   warning_count,
-            "Run ID":     r.get("run_id", ""),
+            "When":         _fmt_timestamp(r.get("generated_at", "")),
+            "Branch":       branch_label,
+            "Verdict":      _VERDICT_ICON.get(verdict, f"⚪ {verdict}"),
+            "Tests":        r.get("test_summary", "—"),
+            "Risk":         f"{_RISK_ICON.get(risk_level, '⚪')} {risk_level.upper()}",
+            "Spec":         r.get("spec_summary", "—"),
+            "Duration":     f"{duration}s" if duration is not None else "—",
+            "Warnings":     warnings_str,
         })
 
     st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
     # Expander: let the user browse the full JSON of any individual run
     with st.expander("🔍 Browse a full run record"):
-        run_ids = [r.get("run_id", "") for r in rows if r.get("run_id")]
-        if not run_ids:
+        # Label each option by branch + timestamp so it's human-scannable
+        def _run_label(r: dict) -> str:
+            branch = r.get("branch", "")
+            branch_label = branch.replace("release/", "") if branch else r.get("repo_commit","")[:7]
+            return f"{_fmt_timestamp(r.get('generated_at',''))}  ·  {branch_label}  ·  {r.get('verdict','')}"
+
+        run_options = [r for r in rows if r.get("run_id")]
+        if not run_options:
             st.caption("No run IDs available.")
         else:
-            selected_id = st.selectbox(
-                "Select run ID",
-                options=run_ids,
-                format_func=lambda rid: rid[:12] + "…",
+            selected = st.selectbox(
+                "Select a run",
+                options=run_options,
+                format_func=_run_label,
                 label_visibility="collapsed",
             )
-            record_path = history_dir / f"{selected_id}.json"
+            record_path = history_dir / f"{selected['run_id']}.json"
             if record_path.exists():
                 full_record = json.loads(record_path.read_text(encoding="utf-8"))
                 st.json(full_record, expanded=False)
             else:
                 st.warning(
-                    f"Full record `{selected_id}.json` not found — "
-                    "it may have been deleted or the app was redeployed."
+                    "Full record not found — it may have been deleted or "
+                    "the app was redeployed (Streamlit Cloud resets the filesystem on restart)."
                 )
 
 
